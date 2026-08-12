@@ -480,6 +480,8 @@ dependencies = [
  "noodles-bgzf",
  "noodles-vcf",
  "rsomics-common",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

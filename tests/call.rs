@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 use rsomics_cnv::call::{CallOptions, analyze};
+use rsomics_cnv::reports::write_call_reports;
 use rsomics_cnv::signals::SampleSelection;
 
 fn write_fixture(path: &Path) {
@@ -100,6 +101,36 @@ fn invalid_call_parameters_fail_before_reading() {
 }
 
 #[test]
+fn result_separates_observed_and_modeled_lrr() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("smoothing.vcf");
+    std::fs::write(
+        &input,
+        "##fileformat=VCFv4.3\n\
+##contig=<ID=chr1,length=100>\n\
+##FORMAT=<ID=BAF,Number=1,Type=Float,Description=\"BAF\">\n\
+##FORMAT=<ID=LRR,Number=1,Type=Float,Description=\"LRR\">\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n\
+chr1\t10\t.\tA\tG\t.\t.\t.\tBAF:LRR\t0.5:0.0\n\
+chr1\t20\t.\tA\tG\t.\t.\t.\tBAF:LRR\t0.5:0.9\n\
+chr1\t30\t.\tA\tG\t.\t.\t.\tBAF:LRR\t0.5:0.0\n",
+    )
+    .unwrap();
+    let result = analyze(
+        &input,
+        SampleSelection::default(),
+        CallOptions {
+            lrr_smoothing_window: 3,
+            ..CallOptions::default()
+        },
+    )
+    .unwrap();
+    let site = &result.chromosomes[0].sites[1];
+    assert!((site.measurement.lrr.unwrap() - 0.9).abs() < 1e-7);
+    assert!((site.modeled_lrr.unwrap() - 0.3).abs() < 1e-7);
+}
+
+#[test]
 fn paired_analysis_retains_query_and_control_marginals() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("paired.vcf");
@@ -167,6 +198,16 @@ fn site_and_region_results_match_bcftools_1_24() {
         CallOptions::default(),
     )
     .unwrap();
+    let ours_output = directory.path().join("rsomics");
+    write_call_reports(&ours_output, &ours).unwrap();
+    assert_eq!(
+        std::fs::read(output.join("dat.SAMPLE.tab")).unwrap(),
+        std::fs::read(ours_output.join("dat.SAMPLE.tab")).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(output.join("cn.SAMPLE.tab")).unwrap(),
+        std::fs::read(ours_output.join("cn.SAMPLE.tab")).unwrap()
+    );
     let chromosome = &ours.chromosomes[0];
     let cn = std::fs::read_to_string(output.join("cn.SAMPLE.tab")).unwrap();
     let upstream_sites = cn
@@ -237,9 +278,19 @@ fn paired_marginals_match_bcftools_1_24() {
         CallOptions::default(),
     )
     .unwrap();
+    let ours_output = directory.path().join("rsomics");
+    write_call_reports(&ours_output, &ours).unwrap();
     let chromosome = &ours.chromosomes[0];
 
     for (name, control) in [("QUERY", false), ("CONTROL", true)] {
+        assert_eq!(
+            std::fs::read(output.join(format!("dat.{name}.tab"))).unwrap(),
+            std::fs::read(ours_output.join(format!("dat.{name}.tab"))).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(output.join(format!("cn.{name}.tab"))).unwrap(),
+            std::fs::read(ours_output.join(format!("cn.{name}.tab"))).unwrap()
+        );
         let cn = std::fs::read_to_string(output.join(format!("cn.{name}.tab"))).unwrap();
         let upstream = cn
             .lines()

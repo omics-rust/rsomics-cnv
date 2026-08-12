@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use rsomics_common::{Result, RsomicsError};
+use serde::Serialize;
 
 use crate::emission::{AlleleFrequencies, EmissionModel, EvidenceParameters, SampleParameters};
 use crate::hmm::{Hmm, phred_error_probability};
@@ -27,21 +28,21 @@ impl Default for CallOptions {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CallResult {
     pub sample: String,
     pub control_sample: Option<String>,
     pub chromosomes: Vec<ChromosomeCall>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ChromosomeCall {
     pub reference_name: String,
     pub sites: Vec<SiteCall>,
     pub regions: Vec<RegionCall>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SiteCall {
     pub position: u32,
     pub copy_number: u8,
@@ -50,10 +51,12 @@ pub struct SiteCall {
     pub posterior: [f64; 4],
     pub control_posterior: Option<[f64; 4]>,
     pub measurement: Measurement,
+    pub modeled_lrr: Option<f64>,
     pub control_measurement: Option<Measurement>,
+    pub control_modeled_lrr: Option<f64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RegionCall {
     pub start: u32,
     pub end: u32,
@@ -153,22 +156,26 @@ fn call_chromosome(
     buffer: &mut ChromosomeBuffer,
     engine: &CallEngine,
 ) -> Result<ChromosomeCall> {
-    smooth_lrr(&mut buffer.query, engine.smoothing_window)?;
-    if engine.paired_hmm.is_some() {
+    let query_lrr = smooth_lrr(&buffer.query, engine.smoothing_window);
+    let control_lrr = if engine.paired_hmm.is_some() {
         if buffer.control.len() != buffer.query.len() {
             return Err(invalid("query and control site counts differ"));
         }
-        smooth_lrr(&mut buffer.control, engine.smoothing_window)?;
-    }
+        Some(smooth_lrr(&buffer.control, engine.smoothing_window))
+    } else {
+        None
+    };
 
     let query_emissions = buffer
         .query
         .iter()
         .copied()
-        .map(|measurement| {
-            engine
-                .model
-                .probabilities(measurement, AlleleFrequencies::default())
+        .zip(query_lrr.iter().copied())
+        .map(|(measurement, lrr)| {
+            engine.model.probabilities(
+                Measurement { lrr, ..measurement },
+                AlleleFrequencies::default(),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     let (path, posterior) = if let Some(hmm) = &engine.paired_hmm {
@@ -176,10 +183,12 @@ fn call_chromosome(
             .control
             .iter()
             .copied()
-            .map(|measurement| {
-                engine
-                    .model
-                    .probabilities(measurement, AlleleFrequencies::default())
+            .zip(control_lrr.as_ref().unwrap().iter().copied())
+            .map(|(measurement, lrr)| {
+                engine.model.probabilities(
+                    Measurement { lrr, ..measurement },
+                    AlleleFrequencies::default(),
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         let emissions = query_emissions
@@ -261,7 +270,9 @@ fn call_chromosome(
             posterior,
             control_posterior,
             measurement,
+            modeled_lrr: query_lrr[index],
             control_measurement: buffer.control.get(index).copied(),
+            control_modeled_lrr: control_lrr.as_ref().and_then(|values| values[index]),
         });
     }
     let regions = regions(&sites)?;
@@ -275,9 +286,12 @@ fn call_chromosome(
     })
 }
 
-fn smooth_lrr(measurements: &mut [Measurement], window: usize) -> Result<()> {
+fn smooth_lrr(measurements: &[Measurement], window: usize) -> Vec<Option<f64>> {
     if window <= 1 || measurements.is_empty() {
-        return Ok(());
+        return measurements
+            .iter()
+            .map(|measurement| measurement.lrr)
+            .collect();
     }
     let values = measurements
         .iter()
@@ -292,12 +306,17 @@ fn smooth_lrr(measurements: &mut [Measurement], window: usize) -> Result<()> {
         let sum = values[start..end].iter().copied().sum::<f32>();
         *output = sum / (end - start) as f32;
     }
-    for (measurement, value) in measurements.iter_mut().zip(smoothed) {
-        if measurement.baf.is_some() {
-            measurement.lrr = Some(f64::from(value));
-        }
-    }
-    Ok(())
+    measurements
+        .iter()
+        .zip(smoothed)
+        .map(|(measurement, value)| {
+            if measurement.baf.is_some() {
+                Some(f64::from(value))
+            } else {
+                measurement.lrr
+            }
+        })
+        .collect()
 }
 
 fn regions(sites: &[SiteCall]) -> Result<Vec<RegionCall>> {

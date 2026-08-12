@@ -3,4 +3,5 @@
 pub mod call;
 pub mod emission;
 pub mod hmm;
+pub mod reports;
 pub mod signals;

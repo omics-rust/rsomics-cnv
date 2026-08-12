@@ -11,6 +11,7 @@ use noodles_vcf::{
     variant::{RecordBuf, record_buf::samples::sample::Value as SampleValue},
 };
 use rsomics_common::{Context, Result, RsomicsError};
+use serde::Serialize;
 
 type Source = Box<dyn Read>;
 type Buffered = BufReader<Source>;
@@ -46,7 +47,7 @@ pub struct SampleSelection {
     pub control: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct Measurement {
     pub baf: Option<f64>,
     pub lrr: Option<f64>,
