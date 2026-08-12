@@ -19,6 +19,8 @@ doctest = false
 [dependencies]
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 libm = "0.2"
+levenberg-marquardt = { version = "0.15", features = ["minpack-compat"] }
+nalgebra = "0.34"
 noodles-bcf = "0.88"
 noodles-vcf = "0.90"
 rsomics-common = "0.12"
