@@ -71,7 +71,7 @@ jobs:
             | shasum -a 256 --check
           tar -xjf "$archive" -C "$RUNNER_TEMP"
           cd "$RUNNER_TEMP/bcftools-1.24"
-          ./configure --without-curses
+          ./configure --without-curses --enable-libgsl
           make -j2
           echo "$RUNNER_TEMP/bcftools-1.24" >> "$GITHUB_PATH"
 
@@ -79,5 +79,7 @@ jobs:
         if: matrix.target == 'linux-x86_64'
         run: |
           test "$(bcftools --version | sed -n '1p')" = "bcftools 1.24"
+          bcftools polysomy --help >"$RUNNER_TEMP/polysomy-help" 2>&1 || true
+          grep -q "Detect number of chromosomal copies" "$RUNNER_TEMP/polysomy-help"
           cargo test --locked --test call -- --ignored
           cargo test --locked --test polysomy -- --ignored
