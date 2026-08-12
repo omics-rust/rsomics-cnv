@@ -167,6 +167,7 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+ "terminal_size",
 ]
 
 [[package]]
@@ -731,6 +732,7 @@ dependencies = [
 name = "rsomics-cnv"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "flate2",
  "levenberg-marquardt",
  "libm",
@@ -739,6 +741,7 @@ dependencies = [
  "noodles-bgzf",
  "noodles-vcf",
  "rsomics-common",
+ "rsomics-help",
  "serde",
  "serde_json",
  "tempfile",
@@ -756,6 +759,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "rsomics-help"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5922ec5a261660869fc36aa05f731c0adb059c43344eb78c2393f05611797fe1"
+dependencies = [
+ "clap",
 ]
 
 [[package]]
@@ -903,6 +915,16 @@ dependencies = [
  "fastrand",
  "getrandom",
  "once_cell",
+ "rustix",
+ "windows-sys",
+]
+
+[[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
  "rustix",
  "windows-sys",
 ]

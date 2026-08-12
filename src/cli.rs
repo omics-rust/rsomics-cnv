@@ -1,0 +1,265 @@
+use std::path::{Path, PathBuf};
+use std::process;
+
+use clap::{Args, Parser, Subcommand};
+use rsomics_common::{OutputArgs, Result, RsomicsError, ToolMeta, run as run_tool};
+use serde::Serialize;
+
+use crate::call::{CallOptions, analyze as analyze_calls};
+use crate::emission::{EvidenceParameters, SampleParameters};
+use crate::polysomy::{PolysomyOptions, analyze as analyze_polysomy};
+use crate::reports::{write_call_reports, write_polysomy_reports};
+use crate::signals::SampleSelection;
+
+const META: ToolMeta = ToolMeta {
+    name: "rsomics-cnv",
+    version: env!("CARGO_PKG_VERSION"),
+};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "rsomics-cnv",
+    version,
+    about = "BAF and LRR copy-number analysis workflows",
+    arg_required_else_help = true,
+    subcommand_required = true
+)]
+struct Cli {
+    #[command(flatten)]
+    output: OutputArgs,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Infer site and region copy-number states with an HMM
+    Call(CallArgs),
+    /// Estimate chromosome copy number from BAF peak distributions
+    Polysomy(PolysomyArgs),
+}
+
+#[derive(Debug, Args)]
+struct CallArgs {
+    /// Coordinate-sorted VCF or BCF containing FORMAT/BAF and FORMAT/LRR
+    #[arg(value_name = "VCF_OR_BCF")]
+    input: PathBuf,
+
+    /// New directory for compatibility and machine-readable reports
+    #[arg(short, long, value_name = "DIRECTORY")]
+    output: PathBuf,
+
+    /// Query sample name; defaults to the only sample in the input
+    #[arg(short, long, value_name = "NAME")]
+    sample: Option<String>,
+
+    /// Matched control sample name
+    #[arg(short, long, value_name = "NAME")]
+    control: Option<String>,
+
+    /// BAF Gaussian standard deviation
+    #[arg(long, default_value_t = 0.04)]
+    baf_deviation: f64,
+
+    /// LRR Gaussian standard deviation
+    #[arg(long, default_value_t = 0.2)]
+    lrr_deviation: f64,
+
+    /// Aberrant-cell fraction used by the CN3 BAF model
+    #[arg(long, default_value_t = 1.0)]
+    aberrant_fraction: f64,
+
+    /// Relative contribution of BAF evidence
+    #[arg(long, default_value_t = 1.0)]
+    baf_weight: f64,
+
+    /// Relative contribution of LRR evidence; zero allows BAF-only input
+    #[arg(long, default_value_t = 0.2)]
+    lrr_weight: f64,
+
+    /// Emission-model error floor
+    #[arg(long, default_value_t = 1e-4)]
+    error_probability: f64,
+
+    /// HMM transition probability per base
+    #[arg(long, default_value_t = 1e-9)]
+    transition_probability: f64,
+
+    /// Prior probability that query and control share a state
+    #[arg(long, default_value_t = 0.5)]
+    same_state_probability: f64,
+
+    /// Number of neighboring sites used for LRR smoothing
+    #[arg(long, default_value_t = 10)]
+    lrr_smoothing_window: usize,
+}
+
+#[derive(Debug, Args)]
+struct PolysomyArgs {
+    /// Coordinate-sorted VCF or BCF containing FORMAT/BAF
+    #[arg(value_name = "VCF_OR_BCF")]
+    input: PathBuf,
+
+    /// New directory for compatibility and machine-readable reports
+    #[arg(short, long, value_name = "DIRECTORY")]
+    output: PathBuf,
+
+    /// Sample name; defaults to the only sample in the input
+    #[arg(short, long, value_name = "NAME")]
+    sample: Option<String>,
+
+    /// Maximum accepted absolute fit deviation
+    #[arg(long, default_value_t = 3.3)]
+    fit_threshold: f64,
+
+    /// Improvement required before selecting a higher copy-number model
+    #[arg(long, default_value_t = 0.7)]
+    copy_number_penalty: f64,
+
+    /// Minimum symmetry of paired BAF peaks
+    #[arg(long, default_value_t = 0.5)]
+    peak_symmetry: f64,
+
+    /// Minimum peak height relative to the fitted distribution
+    #[arg(long, default_value_t = 0.1)]
+    minimum_peak_size: f64,
+
+    /// Minimum chromosome fraction used for a preliminary CN1 decision
+    #[arg(long, default_value_t = 0.1)]
+    minimum_fraction: f64,
+
+    /// Include the homozygous alternate peak in model fitting
+    #[arg(long)]
+    include_aa: bool,
+
+    /// Distribution smoothing parameter; negative values use increasing windows
+    #[arg(long, default_value_t = -3, allow_hyphen_values = true)]
+    smoothing: i32,
+}
+
+#[derive(Debug, Serialize)]
+struct RunSummary {
+    workflow: &'static str,
+    sample: String,
+    output: PathBuf,
+    chromosomes: usize,
+    sites: Option<usize>,
+    regions: Option<usize>,
+}
+
+#[must_use]
+pub(crate) fn run() -> process::ExitCode {
+    let cli = rsomics_help::parse::<Cli>();
+    let output = cli.output.clone();
+    run_tool(&output, META, || execute(cli.command))
+}
+
+fn execute(command: Command) -> Result<RunSummary> {
+    match command {
+        Command::Call(args) => {
+            require_new_output(&args.output)?;
+            let result = analyze_calls(
+                &args.input,
+                SampleSelection {
+                    query: args.sample,
+                    control: args.control,
+                },
+                CallOptions {
+                    sample: SampleParameters {
+                        baf_deviation: args.baf_deviation,
+                        lrr_deviation: args.lrr_deviation,
+                        aberrant_fraction: args.aberrant_fraction,
+                    },
+                    evidence: EvidenceParameters {
+                        baf_weight: args.baf_weight,
+                        lrr_weight: args.lrr_weight,
+                        error_probability: args.error_probability,
+                    },
+                    transition_probability: args.transition_probability,
+                    same_state_probability: args.same_state_probability,
+                    lrr_smoothing_window: args.lrr_smoothing_window,
+                },
+            )?;
+            write_call_reports(&args.output, &result)?;
+            Ok(RunSummary {
+                workflow: "call",
+                sample: result.sample,
+                output: args.output,
+                chromosomes: result.chromosomes.len(),
+                sites: Some(
+                    result
+                        .chromosomes
+                        .iter()
+                        .map(|chromosome| chromosome.sites.len())
+                        .sum(),
+                ),
+                regions: Some(
+                    result
+                        .chromosomes
+                        .iter()
+                        .map(|chromosome| chromosome.regions.len())
+                        .sum(),
+                ),
+            })
+        }
+        Command::Polysomy(args) => {
+            require_new_output(&args.output)?;
+            let result = analyze_polysomy(
+                &args.input,
+                args.sample,
+                PolysomyOptions {
+                    fit_threshold: args.fit_threshold,
+                    copy_number_penalty: args.copy_number_penalty,
+                    peak_symmetry: args.peak_symmetry,
+                    minimum_peak_size: args.minimum_peak_size,
+                    minimum_fraction: args.minimum_fraction,
+                    include_aa: args.include_aa,
+                    smoothing: args.smoothing,
+                },
+            )?;
+            write_polysomy_reports(&args.output, &result)?;
+            Ok(RunSummary {
+                workflow: "polysomy",
+                sample: result.sample,
+                output: args.output,
+                chromosomes: result.chromosomes.len(),
+                sites: None,
+                regions: None,
+            })
+        }
+    }
+}
+
+fn require_new_output(output: &Path) -> Result<()> {
+    if output.exists() {
+        return Err(RsomicsError::ConfigError(format!(
+            "output directory {} already exists",
+            output.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn command_tree_is_valid() {
+        rsomics_help::command::<Cli>().debug_assert();
+    }
+
+    #[test]
+    fn commands_share_the_product_help_tree() {
+        let top = Cli::command().render_long_help().to_string();
+        assert!(top.contains("call"), "{top}");
+        assert!(top.contains("polysomy"), "{top}");
+        let error = Cli::try_parse_from(["rsomics-cnv", "polysomy", "--help"]).unwrap_err();
+        let help = error.to_string();
+        assert!(help.contains("--fit-threshold"), "{help}");
+        assert!(help.contains("--include-aa"), "{help}");
+    }
+}
