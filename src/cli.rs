@@ -104,27 +104,27 @@ struct CallArgs {
     optimize_aberrant_fraction: Option<f64>,
 
     /// Relative contribution of BAF evidence
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(short = 'b', long, default_value_t = 1.0)]
     baf_weight: f64,
 
     /// Relative contribution of LRR evidence; zero allows BAF-only input
-    #[arg(long, default_value_t = 0.2)]
+    #[arg(short = 'l', long, default_value_t = 0.2)]
     lrr_weight: f64,
 
     /// Emission-model error floor
-    #[arg(long, default_value_t = 1e-4)]
+    #[arg(short = 'e', long, default_value_t = 1e-4)]
     error_probability: f64,
 
     /// HMM transition probability per base
-    #[arg(long, default_value_t = 1e-9)]
+    #[arg(short = 'x', long, default_value_t = 1e-9)]
     transition_probability: f64,
 
     /// Prior probability that query and control share a state
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(short = 'P', long, default_value_t = 0.5)]
     same_state_probability: f64,
 
     /// Number of neighboring sites used for LRR smoothing
-    #[arg(long, default_value_t = 10)]
+    #[arg(short = 'L', long, default_value_t = 10)]
     lrr_smoothing_window: usize,
 
     /// Write chromosome SVG plots whose maximum region quality reaches this value
@@ -150,27 +150,27 @@ struct PolysomyArgs {
     selection: SelectionArgs,
 
     /// Maximum accepted absolute fit deviation
-    #[arg(long, default_value_t = 3.3)]
+    #[arg(short = 'f', long, default_value_t = 3.3)]
     fit_threshold: f64,
 
     /// Improvement required before selecting a higher copy-number model
-    #[arg(long, default_value_t = 0.7)]
+    #[arg(short = 'c', long, default_value_t = 0.7)]
     copy_number_penalty: f64,
 
     /// Minimum symmetry of paired BAF peaks
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(short = 'p', long, default_value_t = 0.5)]
     peak_symmetry: f64,
 
     /// Minimum peak height relative to the fitted distribution
-    #[arg(long, default_value_t = 0.1)]
+    #[arg(short = 'b', long, default_value_t = 0.1)]
     minimum_peak_size: f64,
 
     /// Minimum chromosome fraction used for a preliminary CN1 decision
-    #[arg(long, default_value_t = 0.1)]
+    #[arg(short = 'm', long, default_value_t = 0.1)]
     minimum_fraction: f64,
 
     /// Include the homozygous alternate peak in model fitting
-    #[arg(long)]
+    #[arg(short = 'i', long)]
     include_aa: bool,
 
     /// Distribution smoothing parameter; negative values use increasing windows

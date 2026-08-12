@@ -89,6 +89,19 @@ fn help_exposes_one_product_tree() {
     assert!(help.contains("--targets-file <FILE>"), "{help}");
     assert!(help.contains("--optimize <FRACTION>"), "{help}");
     assert!(help.contains("-p, --plot-threshold <QUALITY>"), "{help}");
+    for option in [
+        "-a, --aberrant-fraction",
+        "-b, --baf-weight",
+        "-d, --baf-deviation",
+        "-e, --error-probability",
+        "-k, --lrr-deviation",
+        "-l, --lrr-weight",
+        "-L, --lrr-smoothing-window",
+        "-P, --same-state-probability",
+        "-x, --transition-probability",
+    ] {
+        assert!(help.contains(option), "missing {option}: {help}");
+    }
     assert!(
         help.contains("--regions-overlap <REGIONS_OVERLAP>"),
         "{help}"
@@ -101,6 +114,16 @@ fn help_exposes_one_product_tree() {
     assert!(help.contains("--regions <REGIONS>"), "{help}");
     assert!(help.contains("--targets <TARGETS>"), "{help}");
     assert!(help.contains("--plots"), "{help}");
+    for option in [
+        "-b, --minimum-peak-size",
+        "-c, --copy-number-penalty",
+        "-f, --fit-threshold",
+        "-i, --include-aa",
+        "-m, --minimum-fraction",
+        "-p, --peak-symmetry",
+    ] {
+        assert!(help.contains(option), "missing {option}: {help}");
+    }
 }
 
 #[test]
