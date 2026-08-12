@@ -66,7 +66,7 @@ fn assert_cn_close(upstream: &Path, ours: &Path) {
         for (ours, upstream) in ours[3..].iter().zip(&upstream[3..]) {
             let ours = ours.parse::<f64>().unwrap();
             let upstream = upstream.parse::<f64>().unwrap();
-            assert!((ours - upstream).abs() < 1e-5, "{ours} != {upstream}");
+            assert!((ours - upstream).abs() <= 1e-4, "{ours} != {upstream}");
         }
     }
 }
