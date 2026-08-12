@@ -208,10 +208,6 @@ impl EmissionModel {
         Ok(output)
     }
 
-    pub(crate) fn lrr_weight(&self) -> f64 {
-        self.evidence.lrr_weight
-    }
-
     fn density(&self, baf: f64, peak: usize) -> f64 {
         let peak = self.peaks[peak];
         let variance = self.sample.baf_deviation * self.sample.baf_deviation;

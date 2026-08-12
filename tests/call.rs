@@ -52,6 +52,43 @@ fn write_paired_fixture(path: &Path) {
     std::fs::write(path, text).unwrap();
 }
 
+fn write_optimization_fixture(path: &Path) {
+    let mut text = String::from(
+        "##fileformat=VCFv4.3\n\
+##contig=<ID=chr1,length=1000000>\n\
+##FORMAT=<ID=BAF,Number=1,Type=Float,Description=\"BAF\">\n\
+##FORMAT=<ID=LRR,Number=1,Type=Float,Description=\"LRR\">\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n",
+    );
+    for index in 0..600 {
+        let position = index * 1_000 + 1;
+        let baf = [0.0, 0.4, 0.6, 1.0][index % 4];
+        text.push_str(&format!(
+            "chr1\t{position}\t.\tA\tG\t.\t.\t.\tBAF:LRR\t{baf:.7}:0.3000000\n"
+        ));
+    }
+    std::fs::write(path, text).unwrap();
+}
+
+fn write_paired_optimization_fixture(path: &Path) {
+    let mut text = String::from(
+        "##fileformat=VCFv4.3\n\
+##contig=<ID=chr1,length=1000000>\n\
+##FORMAT=<ID=BAF,Number=1,Type=Float,Description=\"BAF\">\n\
+##FORMAT=<ID=LRR,Number=1,Type=Float,Description=\"LRR\">\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tQUERY\tCONTROL\n",
+    );
+    for index in 0..600 {
+        let position = index * 1_000 + 1;
+        let query = [0.0, 0.4, 0.6, 1.0][index % 4];
+        let control = [0.0, 0.357_142_857, 0.642_857_143, 1.0][index % 4];
+        text.push_str(&format!(
+            "chr1\t{position}\t.\tA\tG\t.\t.\t.\tBAF:LRR\t{query:.9}:0.3000000\t{control:.9}:0.3000000\n"
+        ));
+    }
+    std::fs::write(path, text).unwrap();
+}
+
 #[test]
 fn synthetic_chromosome_recovers_three_copy_number_states() {
     let directory = tempfile::tempdir().unwrap();
@@ -87,6 +124,64 @@ fn synthetic_chromosome_recovers_three_copy_number_states() {
 }
 
 #[test]
+fn optimization_recovers_diluted_cn3_parameters() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("optimization.vcf");
+    write_optimization_fixture(&input);
+    let result = analyze(
+        &input,
+        SampleSelection::default(),
+        CallOptions {
+            optimize_aberrant_fraction: Some(0.2),
+            ..CallOptions::default()
+        },
+    )
+    .unwrap();
+    let estimate = result.chromosomes[0].query_estimate.unwrap();
+    assert!((estimate.fraction - 0.5).abs() < 1e-6);
+    assert!((estimate.baf_deviation - 0.028_284_271).abs() < 1e-6);
+    assert!(
+        result.chromosomes[0]
+            .sites
+            .iter()
+            .all(|site| site.copy_number == 3)
+    );
+}
+
+#[test]
+fn optimization_uses_cn3_variance_without_homozygous_alternate_sites() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("optimization.vcf");
+    let mut text = String::from(
+        "##fileformat=VCFv4.3\n\
+##contig=<ID=chr1,length=1000000>\n\
+##FORMAT=<ID=BAF,Number=1,Type=Float,Description=\"BAF\">\n\
+##FORMAT=<ID=LRR,Number=1,Type=Float,Description=\"LRR\">\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n",
+    );
+    for index in 0..300 {
+        let position = index * 1_000 + 1;
+        let baf = if index % 2 == 0 { 0.4 } else { 0.6 };
+        text.push_str(&format!(
+            "chr1\t{position}\t.\tA\tG\t.\t.\t.\tBAF:LRR\t{baf:.7}:0.3000000\n"
+        ));
+    }
+    std::fs::write(&input, text).unwrap();
+    let result = analyze(
+        &input,
+        SampleSelection::default(),
+        CallOptions {
+            optimize_aberrant_fraction: Some(0.2),
+            ..CallOptions::default()
+        },
+    )
+    .unwrap();
+    let estimate = result.chromosomes[0].query_estimate.unwrap();
+    assert!((estimate.fraction - 0.5).abs() < 1e-6);
+    assert!((estimate.baf_deviation - 0.028_284_271).abs() < 1e-6);
+}
+
+#[test]
 fn invalid_call_parameters_fail_before_reading() {
     let error = analyze(
         Path::new("missing.vcf"),
@@ -109,6 +204,19 @@ fn invalid_call_parameters_fail_before_reading() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("smoothing window"), "{error}");
+    let error = analyze(
+        Path::new("missing.vcf"),
+        SampleSelection::default(),
+        CallOptions {
+            optimize_aberrant_fraction: Some(f64::NAN),
+            ..CallOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("optimization minimum"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -439,5 +547,114 @@ fn allele_frequency_restriction_matches_bcftools_1_24() {
     assert_eq!(
         std::fs::read(output.join("cn.SAMPLE.tab")).unwrap(),
         std::fs::read(ours_output.join("cn.SAMPLE.tab")).unwrap()
+    );
+}
+
+#[test]
+#[ignore = "release oracle: requires bcftools 1.24"]
+fn aberrant_fraction_optimization_matches_bcftools_1_24() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("optimization.vcf");
+    let upstream_output = directory.path().join("bcftools");
+    write_optimization_fixture(&input);
+    let upstream = Command::new("bcftools")
+        .args(["cnv", "-s", "SAMPLE", "-O", "0.2", "-o"])
+        .arg(&upstream_output)
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        upstream.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upstream.stderr)
+    );
+    let ours = analyze(
+        &input,
+        SampleSelection::default(),
+        CallOptions {
+            optimize_aberrant_fraction: Some(0.2),
+            ..CallOptions::default()
+        },
+    )
+    .unwrap();
+    let ours_output = directory.path().join("rsomics");
+    write_call_reports(&ours_output, &ours).unwrap();
+    assert_eq!(
+        std::fs::read(upstream_output.join("dat.SAMPLE.tab")).unwrap(),
+        std::fs::read(ours_output.join("dat.SAMPLE.tab")).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(upstream_output.join("cn.SAMPLE.tab")).unwrap(),
+        std::fs::read(ours_output.join("cn.SAMPLE.tab")).unwrap()
+    );
+    let cf = |path: &Path| {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .find(|line| line.starts_with("CF\t"))
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(
+        cf(&upstream_output.join("summary.SAMPLE.tab")),
+        cf(&ours_output.join("summary.SAMPLE.tab"))
+    );
+    let estimate = ours.chromosomes[0].query_estimate.unwrap();
+    assert!((estimate.fraction - 0.5).abs() < 1e-6);
+    assert!((estimate.baf_deviation - 0.028284).abs() < 1e-6);
+}
+
+#[test]
+#[ignore = "release oracle: requires bcftools 1.24"]
+fn paired_optimization_matches_bcftools_1_24() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("optimization.vcf");
+    let upstream_output = directory.path().join("bcftools");
+    write_paired_optimization_fixture(&input);
+    let upstream = Command::new("bcftools")
+        .args(["cnv", "-s", "QUERY", "-c", "CONTROL", "-O", "0.2", "-o"])
+        .arg(&upstream_output)
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        upstream.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upstream.stderr)
+    );
+    let ours = analyze(
+        &input,
+        SampleSelection {
+            query: Some("QUERY".to_owned()),
+            control: Some("CONTROL".to_owned()),
+        },
+        CallOptions {
+            optimize_aberrant_fraction: Some(0.2),
+            ..CallOptions::default()
+        },
+    )
+    .unwrap();
+    let ours_output = directory.path().join("rsomics");
+    write_call_reports(&ours_output, &ours).unwrap();
+    for name in ["QUERY", "CONTROL"] {
+        assert_eq!(
+            std::fs::read(upstream_output.join(format!("cn.{name}.tab"))).unwrap(),
+            std::fs::read(ours_output.join(format!("cn.{name}.tab"))).unwrap()
+        );
+        let cf = |root: &Path| {
+            std::fs::read_to_string(root.join(format!("summary.{name}.tab")))
+                .unwrap()
+                .lines()
+                .find(|line| line.starts_with("CF\t"))
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(cf(&upstream_output), cf(&ours_output));
+    }
+    let upstream_joint = std::fs::read_to_string(upstream_output.join("summary.tab")).unwrap();
+    let ours_joint = std::fs::read_to_string(ours_output.join("summary.tab")).unwrap();
+    assert_eq!(
+        upstream_joint.lines().find(|line| line.starts_with("CF\t")),
+        ours_joint.lines().find(|line| line.starts_with("CF\t"))
     );
 }

@@ -1,6 +1,6 @@
 use std::fs;
 
-use rsomics_cnv::call::{CallResult, ChromosomeCall, RegionCall, SiteCall};
+use rsomics_cnv::call::{AberrantEstimate, CallResult, ChromosomeCall, RegionCall, SiteCall};
 use rsomics_cnv::polysomy::{
     CandidateFit, ChromosomeDistribution, ChromosomePolysomy, DistributionBin, FitCurve,
     PolysomyResult,
@@ -42,6 +42,8 @@ fn result(control: bool) -> CallResult {
                 heterozygous_sites: 1,
                 control_heterozygous_sites: control.then_some(1),
             }],
+            query_estimate: None,
+            control_estimate: None,
         }],
     }
 }
@@ -118,6 +120,35 @@ fn single_sample_report_bundle_is_complete() {
         json["result"]["chromosomes"][0]["sites"][0]["modeled_lrr"],
         -0.08
     );
+}
+
+#[test]
+fn optimized_call_reports_include_checked_estimates() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("optimized");
+    let mut result = result(false);
+    result.chromosomes[0].query_estimate = Some(AberrantEstimate {
+        fraction: 0.5,
+        baf_deviation: 0.028_284,
+    });
+    write_call_reports(&output, &result).unwrap();
+    let summary = std::fs::read_to_string(output.join("summary.QUERY.tab")).unwrap();
+    assert!(summary.contains("CF\tchr1\t11\t11\t0.50\t0.028284\n"));
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("result.json")).unwrap()).unwrap();
+    assert_eq!(
+        json["result"]["chromosomes"][0]["query_estimate"]["fraction"],
+        0.5
+    );
+
+    let invalid_output = directory.path().join("invalid-estimate");
+    result.chromosomes[0].query_estimate = Some(AberrantEstimate {
+        fraction: f64::NAN,
+        baf_deviation: 0.028_284,
+    });
+    let error = write_call_reports(&invalid_output, &result).unwrap_err();
+    assert!(error.to_string().contains("estimate"), "{error}");
+    assert!(!invalid_output.exists());
 }
 
 #[test]

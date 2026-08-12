@@ -22,9 +22,14 @@ input encoding and can be inverted with `^`. Position, record-span, and
 variant-span overlap policies match bcftools 1.24. BED, VCF, and generic
 tabular files use the shared `rsomics-intervals` coordinate contract.
 
-The crate remains unpublished while call optimization, plotting, and
-representative equivalent-workflow timing and peak-memory measurements are
-completed. Unimplemented behavior is not exposed by the CLI.
+`call --optimize FRACTION` estimates chromosome-specific aberrant-cell
+fractions and BAF deviations for query and control samples, records them in
+compatibility and JSON reports, and falls back to the declared starting model
+when the iterative fit does not converge.
+
+The crate remains unpublished while plotting and representative
+equivalent-workflow timing and peak-memory measurements are completed.
+Unimplemented behavior is not exposed by the CLI.
 
 The compatibility reference is bcftools 1.24 `cnv`, `polysomy`, `HMM.c`, and
 `peakfit.c`, retained under the upstream MIT license. Historical rsomics

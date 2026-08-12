@@ -13,6 +13,7 @@ const DAT_HEADER: &str = "# [1]Chromosome\t[2]Position\t[3]BAF\t[4]LRR\n";
 const CN_HEADER: &str =
     "# [1]Chromosome\t[2]Position\t[3]CN\t[4]P(CN0)\t[5]P(CN1)\t[6]P(CN2)\t[7]P(CN3)\n";
 const SUMMARY_HEADER: &str = "# RG, Regions\t[2]Chromosome\t[3]Start\t[4]End\t[5]Copy Number state\t[6]Quality\t[7]nSites\t[8]nHETs\n";
+const ESTIMATE_HEADER: &str = "# CF, cell fraction estimate\t[2]Chromosome\t[3]Start\t[4]End\t[5]Cell fraction\t[6]BAF deviation\n";
 
 #[derive(Serialize)]
 struct ResultDocument<'a, T> {
@@ -242,7 +243,26 @@ fn write_summary(
     writer
         .write_all(SUMMARY_HEADER.as_bytes())
         .map_err(RsomicsError::Io)?;
+    if chromosomes.iter().any(|chromosome| {
+        if control {
+            chromosome.control_estimate.is_some()
+        } else {
+            chromosome.query_estimate.is_some()
+        }
+    }) {
+        writer
+            .write_all(ESTIMATE_HEADER.as_bytes())
+            .map_err(RsomicsError::Io)?;
+    }
     for chromosome in chromosomes {
+        let estimate = if control {
+            chromosome.control_estimate
+        } else {
+            chromosome.query_estimate
+        };
+        if let Some(estimate) = estimate {
+            write_estimate(writer, chromosome, estimate)?;
+        }
         for region in &chromosome.regions {
             let copy_number = if control {
                 region
@@ -286,7 +306,37 @@ fn write_joint_summary(writer: &mut dyn Write, result: &CallResult) -> Result<()
         result.sample, control
     )
     .map_err(RsomicsError::Io)?;
+    if result
+        .chromosomes
+        .iter()
+        .any(|chromosome| chromosome.query_estimate.is_some())
+    {
+        writeln!(
+            writer,
+            "# CF, cell fraction estimate\t[2]Chromosome\t[3]Start\t[4]End\t[5]Cell fraction:{}\t[6]Cell fraction:{}\t[7]BAF deviation:{}\t[8]BAF deviation:{}",
+            result.sample, control, result.sample, control
+        )
+        .map_err(RsomicsError::Io)?;
+    }
     for chromosome in &result.chromosomes {
+        if let Some(query) = chromosome.query_estimate {
+            let control = chromosome
+                .control_estimate
+                .ok_or_else(|| inconsistent("missing control aberrant-fraction estimate"))?;
+            let (start, end) = chromosome_bounds(chromosome)?;
+            writeln!(
+                writer,
+                "CF\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.6}\t{:.6}",
+                chromosome.reference_name,
+                start,
+                end,
+                query.fraction,
+                control.fraction,
+                query.baf_deviation,
+                control.baf_deviation
+            )
+            .map_err(RsomicsError::Io)?;
+        }
         for region in &chromosome.regions {
             writeln!(
                 writer,
@@ -312,6 +362,34 @@ fn write_joint_summary(writer: &mut dyn Write, result: &CallResult) -> Result<()
     Ok(())
 }
 
+fn write_estimate(
+    writer: &mut dyn Write,
+    chromosome: &ChromosomeCall,
+    estimate: crate::call::AberrantEstimate,
+) -> Result<()> {
+    let (start, end) = chromosome_bounds(chromosome)?;
+    writeln!(
+        writer,
+        "CF\t{}\t{}\t{}\t{:.2}\t{:.6}",
+        chromosome.reference_name, start, end, estimate.fraction, estimate.baf_deviation
+    )
+    .map_err(RsomicsError::Io)
+}
+
+fn chromosome_bounds(chromosome: &ChromosomeCall) -> Result<(u32, u32)> {
+    let start = chromosome
+        .sites
+        .first()
+        .ok_or_else(|| inconsistent("chromosome has no sites"))?
+        .position;
+    let end = chromosome
+        .sites
+        .last()
+        .ok_or_else(|| inconsistent("chromosome has no sites"))?
+        .position;
+    Ok((start, end))
+}
+
 fn write_file(path: PathBuf, body: impl FnOnce(&mut dyn Write) -> Result<()>) -> Result<()> {
     let file = File::create(&path)
         .rs_with_context(|| format!("creating staged report {}", path.display()))?;
@@ -332,6 +410,55 @@ fn validate_call_result(result: &CallResult) -> Result<()> {
         validate_sample_name(control)?;
         if control == result.sample {
             return Err(inconsistent("query and control sample names are equal"));
+        }
+    }
+    if result.chromosomes.is_empty() {
+        return Err(inconsistent("result has no chromosomes"));
+    }
+    let optimized = result.chromosomes[0].query_estimate.is_some();
+    let mut references = HashSet::new();
+    for chromosome in &result.chromosomes {
+        if chromosome.reference_name.is_empty()
+            || !references.insert(chromosome.reference_name.as_str())
+        {
+            return Err(inconsistent("reference names are empty or duplicated"));
+        }
+        if chromosome.sites.is_empty() {
+            return Err(inconsistent(format!(
+                "{} has no sites",
+                chromosome.reference_name
+            )));
+        }
+        if chromosome.query_estimate.is_some() != optimized {
+            return Err(inconsistent(
+                "query aberrant-fraction estimates are incomplete",
+            ));
+        }
+        if result.control_sample.is_some() {
+            if chromosome.control_estimate.is_some() != optimized {
+                return Err(inconsistent(
+                    "control aberrant-fraction estimates are incomplete",
+                ));
+            }
+        } else if chromosome.control_estimate.is_some() {
+            return Err(inconsistent(
+                "control estimate is present without a control sample",
+            ));
+        }
+        for estimate in [chromosome.query_estimate, chromosome.control_estimate]
+            .into_iter()
+            .flatten()
+        {
+            if !estimate.fraction.is_finite()
+                || !(0.0..=1.0).contains(&estimate.fraction)
+                || !estimate.baf_deviation.is_finite()
+                || estimate.baf_deviation <= 0.0
+            {
+                return Err(inconsistent(format!(
+                    "{} has an invalid aberrant-fraction estimate",
+                    chromosome.reference_name
+                )));
+            }
         }
     }
     Ok(())

@@ -68,6 +68,7 @@ fn help_exposes_one_product_tree() {
     assert!(help.contains("--allele-frequencies <TSV>"), "{help}");
     assert!(help.contains("--regions-file <FILE>"), "{help}");
     assert!(help.contains("--targets-file <FILE>"), "{help}");
+    assert!(help.contains("--optimize <FRACTION>"), "{help}");
     assert!(
         help.contains("--regions-overlap <REGIONS_OVERLAP>"),
         "{help}"

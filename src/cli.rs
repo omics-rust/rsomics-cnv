@@ -80,6 +80,10 @@ struct CallArgs {
     #[arg(long, default_value_t = 1.0)]
     aberrant_fraction: f64,
 
+    /// Estimate aberrant-cell fraction per chromosome down to this minimum
+    #[arg(short = 'O', long = "optimize", value_name = "FRACTION")]
+    optimize_aberrant_fraction: Option<f64>,
+
     /// Relative contribution of BAF evidence
     #[arg(long, default_value_t = 1.0)]
     baf_weight: f64,
@@ -285,6 +289,7 @@ fn execute(command: Command) -> Result<RunSummary> {
                 transition_probability: args.transition_probability,
                 same_state_probability: args.same_state_probability,
                 lrr_smoothing_window: args.lrr_smoothing_window,
+                optimize_aberrant_fraction: args.optimize_aberrant_fraction,
             };
             let result = if let Some(frequencies) = args.allele_frequencies {
                 analyze_with_allele_frequencies_selected(
