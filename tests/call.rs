@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 use rsomics_cnv::call::{CallOptions, analyze, analyze_with_allele_frequencies};
+use rsomics_cnv::emission::SampleParameters;
 use rsomics_cnv::reports::write_call_reports;
 use rsomics_cnv::signals::SampleSelection;
 
@@ -217,6 +218,19 @@ fn invalid_call_parameters_fail_before_reading() {
         error.to_string().contains("optimization minimum"),
         "{error}"
     );
+    let error = analyze(
+        Path::new("missing.vcf"),
+        SampleSelection::default(),
+        CallOptions {
+            control_sample: Some(SampleParameters::default()),
+            ..CallOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("control sample parameters"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -316,6 +330,63 @@ fn paired_analysis_retains_query_and_control_marginals() {
             && site.control_copy_number == Some(2)
             && site.state_probability.is_finite()
     }));
+}
+
+#[test]
+#[ignore = "release oracle: requires bcftools 1.24"]
+fn distinct_control_parameters_match_bcftools_1_24() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("paired.vcf");
+    let upstream_output = directory.path().join("bcftools");
+    write_paired_fixture(&input);
+    let upstream = Command::new("bcftools")
+        .args([
+            "cnv",
+            "-s",
+            "QUERY",
+            "-c",
+            "CONTROL",
+            "-d",
+            "0.04,0.12",
+            "-k",
+            "0.2,0.5",
+            "-a",
+            "1.0,0.5",
+            "-o",
+        ])
+        .arg(&upstream_output)
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        upstream.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upstream.stderr)
+    );
+    let ours = analyze(
+        &input,
+        SampleSelection {
+            query: Some("QUERY".to_owned()),
+            control: Some("CONTROL".to_owned()),
+        },
+        CallOptions {
+            control_sample: Some(SampleParameters {
+                baf_deviation: 0.12,
+                lrr_deviation: 0.5,
+                aberrant_fraction: 0.5,
+            }),
+            ..CallOptions::default()
+        },
+    )
+    .unwrap();
+    let ours_output = directory.path().join("rsomics");
+    write_call_reports(&ours_output, &ours).unwrap();
+    for name in ["QUERY", "CONTROL"] {
+        assert_eq!(
+            std::fs::read(upstream_output.join(format!("cn.{name}.tab"))).unwrap(),
+            std::fs::read(ours_output.join(format!("cn.{name}.tab"))).unwrap()
+        );
+    }
 }
 
 #[test]

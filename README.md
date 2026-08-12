@@ -25,7 +25,8 @@ tabular files use the shared `rsomics-intervals` coordinate contract.
 `call --optimize FRACTION` estimates chromosome-specific aberrant-cell
 fractions and BAF deviations for query and control samples, records them in
 compatibility and JSON reports, and falls back to the declared starting model
-when the iterative fit does not converge.
+when the iterative fit does not converge. `-a`, `-d`, and `-k` accept either a
+query value or `QUERY,CONTROL` values for matched samples.
 
 `call -p QUALITY` adds LRR, BAF, and copy-number SVGs for chromosomes reaching
 the requested region quality. `polysomy --plots` adds fitted BAF-distribution

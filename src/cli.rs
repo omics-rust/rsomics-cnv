@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process;
+use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rsomics_common::{OutputArgs, Result, RsomicsError, ToolMeta, run as run_tool};
@@ -71,17 +72,32 @@ struct CallArgs {
     #[command(flatten)]
     selection: SelectionArgs,
 
-    /// BAF Gaussian standard deviation
-    #[arg(long, default_value_t = 0.04)]
-    baf_deviation: f64,
+    /// Query BAF Gaussian deviation; append ,CONTROL for a matched control
+    #[arg(
+        short = 'd',
+        long,
+        default_value = "0.04",
+        value_name = "QUERY[,CONTROL]"
+    )]
+    baf_deviation: SampleParameter,
 
-    /// LRR Gaussian standard deviation
-    #[arg(long, default_value_t = 0.2)]
-    lrr_deviation: f64,
+    /// Query LRR Gaussian deviation; append ,CONTROL for a matched control
+    #[arg(
+        short = 'k',
+        long,
+        default_value = "0.2",
+        value_name = "QUERY[,CONTROL]"
+    )]
+    lrr_deviation: SampleParameter,
 
-    /// Aberrant-cell fraction used by the CN3 BAF model
-    #[arg(long, default_value_t = 1.0)]
-    aberrant_fraction: f64,
+    /// Query aberrant-cell fraction; append ,CONTROL for a matched control
+    #[arg(
+        short = 'a',
+        long,
+        default_value = "1.0",
+        value_name = "QUERY[,CONTROL]"
+    )]
+    aberrant_fraction: SampleParameter,
 
     /// Estimate aberrant-cell fraction per chromosome down to this minimum
     #[arg(short = 'O', long = "optimize", value_name = "FRACTION")]
@@ -174,6 +190,32 @@ enum OverlapArg {
     Record,
     #[value(name = "2")]
     Variant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SampleParameter {
+    query: f64,
+    control: Option<f64>,
+}
+
+impl FromStr for SampleParameter {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let mut values = value.split(',');
+        let query = parse_parameter(values.next().unwrap_or_default())?;
+        let control = values.next().map(parse_parameter).transpose()?;
+        if values.next().is_some() {
+            return Err("expected QUERY or QUERY,CONTROL".to_owned());
+        }
+        Ok(Self { query, control })
+    }
+}
+
+fn parse_parameter(value: &str) -> std::result::Result<f64, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{value:?} is not a floating-point value"))
 }
 
 impl From<OverlapArg> for OverlapMode {
@@ -281,17 +323,15 @@ fn execute(command: Command) -> Result<RunSummary> {
     match command {
         Command::Call(args) => {
             require_new_output(&args.output)?;
+            let (sample, control_sample) = call_sample_parameters(&args)?;
             let site_selection = args.selection.build()?;
             let selection = SampleSelection {
                 query: args.sample,
                 control: args.control,
             };
             let options = CallOptions {
-                sample: SampleParameters {
-                    baf_deviation: args.baf_deviation,
-                    lrr_deviation: args.lrr_deviation,
-                    aberrant_fraction: args.aberrant_fraction,
-                },
+                sample,
+                control_sample,
                 evidence: EvidenceParameters {
                     baf_weight: args.baf_weight,
                     lrr_weight: args.lrr_weight,
@@ -373,6 +413,41 @@ fn execute(command: Command) -> Result<RunSummary> {
             })
         }
     }
+}
+
+fn call_sample_parameters(args: &CallArgs) -> Result<(SampleParameters, Option<SampleParameters>)> {
+    let sample = SampleParameters {
+        baf_deviation: args.baf_deviation.query,
+        lrr_deviation: args.lrr_deviation.query,
+        aberrant_fraction: args.aberrant_fraction.query,
+    };
+    let distinct = [
+        args.baf_deviation.control,
+        args.lrr_deviation.control,
+        args.aberrant_fraction.control,
+    ]
+    .into_iter()
+    .any(|value| value.is_some());
+    if args.control.is_none() && distinct {
+        return Err(RsomicsError::InvalidInput(
+            "paired model parameters require --control".to_owned(),
+        ));
+    }
+    let control = args.control.as_ref().map(|_| SampleParameters {
+        baf_deviation: args
+            .baf_deviation
+            .control
+            .unwrap_or(args.baf_deviation.query),
+        lrr_deviation: args
+            .lrr_deviation
+            .control
+            .unwrap_or(args.lrr_deviation.query),
+        aberrant_fraction: args
+            .aberrant_fraction
+            .control
+            .unwrap_or(args.aberrant_fraction.query),
+    });
+    Ok((sample, control))
 }
 
 fn require_new_output(output: &Path) -> Result<()> {

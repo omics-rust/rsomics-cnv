@@ -51,6 +51,25 @@ fn write_polysomy_fixture(path: &Path) {
     std::fs::write(path, text).unwrap();
 }
 
+fn write_paired_call_fixture(path: &Path) {
+    let mut text = String::from(
+        "##fileformat=VCFv4.3\n\
+##contig=<ID=chr1,length=1000000>\n\
+##FORMAT=<ID=BAF,Number=1,Type=Float,Description=\"B-allele frequency\">\n\
+##FORMAT=<ID=LRR,Number=1,Type=Float,Description=\"Log R ratio\">\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tQUERY\tCONTROL\n",
+    );
+    for index in 0..90 {
+        let query_baf = [0.0, 0.5, 1.0][index % 3];
+        let control_baf = [0.0, 0.4, 0.6, 1.0][index % 4];
+        text.push_str(&format!(
+            "chr1\t{}\t.\tA\tG\t.\t.\t.\tBAF:LRR\t{query_baf:.7}:0.0000000\t{control_baf:.7}:0.3000000\n",
+            index * 5_000 + 1_000
+        ));
+    }
+    std::fs::write(path, text).unwrap();
+}
+
 #[test]
 fn help_exposes_one_product_tree() {
     let output = binary().arg("--help").output().unwrap();
@@ -162,6 +181,81 @@ fn polysomy_writes_reports_and_fails_on_existing_output() {
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("already exists"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn paired_call_accepts_distinct_control_model_parameters() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("paired.vcf");
+    write_paired_call_fixture(&input);
+    let run = |parameter: Option<(&str, &str)>, output: &Path| {
+        let mut command = binary();
+        command.args(["call", "--sample", "QUERY", "--control", "CONTROL"]);
+        if let Some((name, value)) = parameter {
+            command.args([name, value]);
+        }
+        command
+            .arg("--output")
+            .arg(output)
+            .arg(&input)
+            .output()
+            .unwrap()
+    };
+    let shared = directory.path().join("shared");
+    let shared_run = run(None, &shared);
+    assert!(
+        shared_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shared_run.stderr)
+    );
+    let read_control_posterior = |output: &Path| {
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output.join("result.json")).unwrap()).unwrap();
+        document["result"]["chromosomes"][0]["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|site| site["control_posterior"].as_array().unwrap())
+            .map(|value| value.as_f64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    let shared_posterior = read_control_posterior(&shared);
+    for (index, (name, value)) in [("-d", "0.04,0.12"), ("-k", "0.2,0.5"), ("-a", "1.0,0.5")]
+        .into_iter()
+        .enumerate()
+    {
+        let distinct = directory.path().join(format!("distinct-{index}"));
+        let distinct_run = run(Some((name, value)), &distinct);
+        assert!(
+            distinct_run.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&distinct_run.stderr)
+        );
+        assert_ne!(
+            shared_posterior,
+            read_control_posterior(&distinct),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn paired_model_parameters_require_a_control_sample() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("call.vcf");
+    write_call_fixture(&input);
+    let output = binary()
+        .args(["call", "-d", "0.04,0.12", "--output"])
+        .arg(directory.path().join("reports"))
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("require --control"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );

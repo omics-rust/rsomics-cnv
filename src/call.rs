@@ -12,6 +12,7 @@ use crate::signals::{Measurement, RequiredSignals, SampleSelection, SelectedSign
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CallOptions {
     pub sample: SampleParameters,
+    pub control_sample: Option<SampleParameters>,
     pub evidence: EvidenceParameters,
     pub transition_probability: f64,
     pub same_state_probability: f64,
@@ -23,6 +24,7 @@ impl Default for CallOptions {
     fn default() -> Self {
         Self {
             sample: SampleParameters::default(),
+            control_sample: None,
             evidence: EvidenceParameters::default(),
             transition_probability: 1e-9,
             same_state_probability: 0.5,
@@ -81,7 +83,8 @@ pub struct RegionCall {
 }
 
 struct CallEngine {
-    sample: SampleParameters,
+    query: SampleParameters,
+    control: Option<SampleParameters>,
     evidence: EvidenceParameters,
     single_hmm: Hmm,
     paired_hmm: Option<Hmm>,
@@ -233,9 +236,22 @@ impl CallEngine {
                 "optimization minimum must be finite and between 0 and 1",
             ));
         }
+        let control = match (paired, options.control_sample) {
+            (true, value) => Some(value.unwrap_or(options.sample)),
+            (false, Some(_)) => {
+                return Err(invalid(
+                    "control sample parameters require a control sample",
+                ));
+            }
+            (false, None) => None,
+        };
         EmissionModel::new(options.sample, options.evidence)?;
+        if let Some(parameters) = control {
+            EmissionModel::new(parameters, options.evidence)?;
+        }
         Ok(Self {
-            sample: options.sample,
+            query: options.sample,
+            control,
             evidence: options.evidence,
             single_hmm: Hmm::single_sample(options.transition_probability)?,
             paired_hmm: paired
@@ -437,13 +453,10 @@ fn optimize(
     engine: &CallEngine,
 ) -> Result<(SampleParameters, Option<SampleParameters>)> {
     let Some(minimum) = engine.optimization_minimum else {
-        return Ok((
-            engine.sample,
-            engine.paired_hmm.as_ref().map(|_| engine.sample),
-        ));
+        return Ok((engine.query, engine.control));
     };
-    let mut query = engine.sample;
-    let mut control = engine.paired_hmm.as_ref().map(|_| engine.sample);
+    let mut query = engine.query;
+    let mut control = engine.control;
     for iteration in 0..20 {
         let inference = infer(buffer, query_lrr, control_lrr, engine, query, control)?;
         let query_converged = update_parameters(
@@ -451,7 +464,7 @@ fn optimize(
             &inference.posterior,
             false,
             engine.paired_hmm.is_some(),
-            engine.sample,
+            engine.query,
             &mut query,
             minimum,
         )?;
@@ -461,7 +474,9 @@ fn optimize(
                 &inference.posterior,
                 true,
                 true,
-                engine.sample,
+                engine
+                    .control
+                    .ok_or_else(|| invalid("paired optimization has no control parameters"))?,
                 parameters,
                 minimum,
             )?
@@ -472,10 +487,7 @@ fn optimize(
             return Ok((query, control));
         }
         if iteration == 19 {
-            return Ok((
-                engine.sample,
-                engine.paired_hmm.as_ref().map(|_| engine.sample),
-            ));
+            return Ok((engine.query, engine.control));
         }
     }
     unreachable!()
