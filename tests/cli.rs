@@ -69,6 +69,7 @@ fn help_exposes_one_product_tree() {
     assert!(help.contains("--regions-file <FILE>"), "{help}");
     assert!(help.contains("--targets-file <FILE>"), "{help}");
     assert!(help.contains("--optimize <FRACTION>"), "{help}");
+    assert!(help.contains("-p, --plot-threshold <QUALITY>"), "{help}");
     assert!(
         help.contains("--regions-overlap <REGIONS_OVERLAP>"),
         "{help}"
@@ -80,6 +81,7 @@ fn help_exposes_one_product_tree() {
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("--regions <REGIONS>"), "{help}");
     assert!(help.contains("--targets <TARGETS>"), "{help}");
+    assert!(help.contains("--plots"), "{help}");
 }
 
 #[test]
@@ -107,6 +109,7 @@ fn call_writes_reports_and_shared_json_envelope() {
         .arg(&frequencies)
         .arg("--targets-file")
         .arg(&targets)
+        .args(["--plot-threshold", "0"])
         .arg("--output")
         .arg(&reports)
         .arg(&input)
@@ -125,6 +128,7 @@ fn call_writes_reports_and_shared_json_envelope() {
     assert_eq!(document["result"]["sites"], 1);
     assert!(reports.join("result.json").is_file());
     assert!(reports.join("summary.SAMPLE.tab").is_file());
+    assert!(reports.join("plot.SAMPLE.chr1.svg").is_file());
 }
 
 #[test]
@@ -135,7 +139,7 @@ fn polysomy_writes_reports_and_fails_on_existing_output() {
     write_polysomy_fixture(&input);
     let run = || {
         binary()
-            .args(["polysomy", "--sample", "SAMPLE", "--output"])
+            .args(["polysomy", "--sample", "SAMPLE", "--plots", "--output"])
             .arg(&reports)
             .arg(&input)
             .output()
@@ -150,6 +154,8 @@ fn polysomy_writes_reports_and_fails_on_existing_output() {
     assert!(output.stdout.is_empty());
     assert!(reports.join("dist.dat").is_file());
     assert!(reports.join("result.json").is_file());
+    assert!(reports.join("distribution.chr1.svg").is_file());
+    assert!(reports.join("copy-number.svg").is_file());
 
     std::fs::remove_file(&input).unwrap();
     let output = run();

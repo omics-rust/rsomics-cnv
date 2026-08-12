@@ -98,6 +98,8 @@ pub struct FitCurve {
     pub end_bin: usize,
     pub absolute_deviation: f64,
     pub function: String,
+    #[serde(skip)]
+    pub fitted: Vec<DistributionBin>,
 }
 
 struct Histogram {
@@ -558,6 +560,15 @@ fn fit_cn4(
 }
 
 fn curve(outcome: FitOutcome, start_bin: usize, end_bin: usize) -> FitCurve {
+    let fitted = (start_bin..=end_bin)
+        .map(|index| {
+            let baf = index as f64 / (BINS - 1) as f64;
+            DistributionBin {
+                baf,
+                normalized_count: outcome.peaks.iter().map(|peak| peak.value(baf)).sum(),
+            }
+        })
+        .collect();
     FitCurve {
         start_bin,
         end_bin,
@@ -568,6 +579,7 @@ fn curve(outcome: FitOutcome, start_bin: usize, end_bin: usize) -> FitCurve {
             .map(Peak::function)
             .collect::<Vec<_>>()
             .join(" + "),
+        fitted,
     }
 }
 

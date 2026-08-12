@@ -7,6 +7,7 @@ use rsomics_common::{Context, Result, RsomicsError};
 use serde::Serialize;
 
 use crate::call::{CallResult, ChromosomeCall};
+use crate::plots::{for_each_call_plot, for_each_polysomy_plot};
 use crate::polysomy::{BINS, PolysomyResult};
 
 const DAT_HEADER: &str = "# [1]Chromosome\t[2]Position\t[3]BAF\t[4]LRR\n";
@@ -28,7 +29,25 @@ struct Producer {
     version: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CallReportOptions {
+    pub plot_threshold: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PolysomyReportOptions {
+    pub plots: bool,
+}
+
 pub fn write_call_reports(output: &Path, result: &CallResult) -> Result<()> {
+    write_call_reports_with_options(output, result, CallReportOptions::default())
+}
+
+pub fn write_call_reports_with_options(
+    output: &Path,
+    result: &CallResult,
+    options: CallReportOptions,
+) -> Result<()> {
     validate_call_result(result)?;
     write_report_directory(output, |directory| {
         write_sample_reports(directory, result, false)?;
@@ -42,11 +61,25 @@ pub fn write_call_reports(output: &Path, result: &CallResult) -> Result<()> {
             directory.join("result.json"),
             "rsomics-cnv/call-result/v1",
             result,
-        )
+        )?;
+        if let Some(threshold) = options.plot_threshold {
+            for_each_call_plot(result, threshold, |name, svg| {
+                write_plot(directory, name, svg)
+            })?;
+        }
+        Ok(())
     })
 }
 
 pub fn write_polysomy_reports(output: &Path, result: &PolysomyResult) -> Result<()> {
+    write_polysomy_reports_with_options(output, result, PolysomyReportOptions::default())
+}
+
+pub fn write_polysomy_reports_with_options(
+    output: &Path,
+    result: &PolysomyResult,
+    options: PolysomyReportOptions,
+) -> Result<()> {
     validate_polysomy_result(result)?;
     write_report_directory(output, |directory| {
         write_file(directory.join("dist.dat"), |writer| {
@@ -56,7 +89,17 @@ pub fn write_polysomy_reports(output: &Path, result: &PolysomyResult) -> Result<
             directory.join("result.json"),
             "rsomics-cnv/polysomy-result/v1",
             result,
-        )
+        )?;
+        if options.plots {
+            for_each_polysomy_plot(result, |name, svg| write_plot(directory, name, svg))?;
+        }
+        Ok(())
+    })
+}
+
+fn write_plot(directory: &Path, name: String, svg: String) -> Result<()> {
+    write_file(directory.join(name), |writer| {
+        writer.write_all(svg.as_bytes()).map_err(RsomicsError::Io)
     })
 }
 
@@ -423,9 +466,9 @@ fn validate_call_result(result: &CallResult) -> Result<()> {
         {
             return Err(inconsistent("reference names are empty or duplicated"));
         }
-        if chromosome.sites.is_empty() {
+        if chromosome.sites.is_empty() || chromosome.regions.is_empty() {
             return Err(inconsistent(format!(
-                "{} has no sites",
+                "{} has no sites or regions",
                 chromosome.reference_name
             )));
         }
@@ -534,11 +577,25 @@ fn validate_polysomy_result(result: &PolysomyResult) -> Result<()> {
                     || !curve.absolute_deviation.is_finite()
                     || curve.absolute_deviation < 0.0
                     || curve.function.is_empty()
+                    || curve.fitted.len() != curve.end_bin - curve.start_bin + 1
                 {
                     return Err(inconsistent_polysomy(format!(
                         "{} has an invalid fit curve",
                         distribution.reference_name
                     )));
+                }
+                for (index, bin) in (curve.start_bin..=curve.end_bin).zip(&curve.fitted) {
+                    let expected = index as f64 / (BINS - 1) as f64;
+                    if !bin.baf.is_finite()
+                        || (bin.baf - expected).abs() > 1e-12
+                        || !bin.normalized_count.is_finite()
+                        || bin.normalized_count < 0.0
+                    {
+                        return Err(inconsistent_polysomy(format!(
+                            "{} has an invalid fitted curve point",
+                            distribution.reference_name
+                        )));
+                    }
                 }
             }
             if candidate.selected {

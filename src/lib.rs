@@ -6,6 +6,7 @@ mod cli;
 pub mod emission;
 mod fitting;
 pub mod hmm;
+mod plots;
 pub mod polysomy;
 pub mod reports;
 pub mod selection;

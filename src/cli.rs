@@ -10,7 +10,10 @@ use crate::call::{
 };
 use crate::emission::{EvidenceParameters, SampleParameters};
 use crate::polysomy::{PolysomyOptions, analyze_selected as analyze_polysomy};
-use crate::reports::{write_call_reports, write_polysomy_reports};
+use crate::reports::{
+    CallReportOptions, PolysomyReportOptions, write_call_reports_with_options,
+    write_polysomy_reports_with_options,
+};
 use crate::selection::{OverlapMode, SiteSelection};
 use crate::signals::SampleSelection;
 
@@ -107,6 +110,10 @@ struct CallArgs {
     /// Number of neighboring sites used for LRR smoothing
     #[arg(long, default_value_t = 10)]
     lrr_smoothing_window: usize,
+
+    /// Write chromosome SVG plots whose maximum region quality reaches this value
+    #[arg(short = 'p', long, value_name = "QUALITY")]
+    plot_threshold: Option<f64>,
 }
 
 #[derive(Debug, Args)]
@@ -153,6 +160,10 @@ struct PolysomyArgs {
     /// Distribution smoothing parameter; negative values use increasing windows
     #[arg(long, default_value_t = -3, allow_hyphen_values = true)]
     smoothing: i32,
+
+    /// Write BAF-distribution and chromosome copy-number SVG plots
+    #[arg(long)]
+    plots: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -302,7 +313,13 @@ fn execute(command: Command) -> Result<RunSummary> {
             } else {
                 analyze_calls(&args.input, selection, options, &site_selection)?
             };
-            write_call_reports(&args.output, &result)?;
+            write_call_reports_with_options(
+                &args.output,
+                &result,
+                CallReportOptions {
+                    plot_threshold: args.plot_threshold,
+                },
+            )?;
             Ok(RunSummary {
                 workflow: "call",
                 sample: result.sample,
@@ -341,7 +358,11 @@ fn execute(command: Command) -> Result<RunSummary> {
                 },
                 &site_selection,
             )?;
-            write_polysomy_reports(&args.output, &result)?;
+            write_polysomy_reports_with_options(
+                &args.output,
+                &result,
+                PolysomyReportOptions { plots: args.plots },
+            )?;
             Ok(RunSummary {
                 workflow: "polysomy",
                 sample: result.sample,

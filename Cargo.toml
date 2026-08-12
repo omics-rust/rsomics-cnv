@@ -27,6 +27,7 @@ noodles-bgzf = "0.49"
 noodles-core = "0.20"
 noodles-util = { version = "0.82", features = ["variant"] }
 noodles-vcf = "0.90"
+plotters = { version = "0.3.7", default-features = false, features = ["line_series", "point_series", "svg_backend"] }
 rsomics-common = "0.12"
 rsomics-help = "0.4"
 rsomics-intervals = "0.4"

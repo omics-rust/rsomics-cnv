@@ -115,7 +115,7 @@ impl Peak {
         };
     }
 
-    fn value(&self, x: f64) -> f64 {
+    pub(crate) fn value(&self, x: f64) -> f64 {
         let [scale, center, deviation] = self.physical_parameters();
         match self.kind {
             PeakKind::Exponential => scale * scale * ((x - center) / deviation.powi(2)).exp(),

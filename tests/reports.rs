@@ -3,9 +3,12 @@ use std::fs;
 use rsomics_cnv::call::{AberrantEstimate, CallResult, ChromosomeCall, RegionCall, SiteCall};
 use rsomics_cnv::polysomy::{
     CandidateFit, ChromosomeDistribution, ChromosomePolysomy, DistributionBin, FitCurve,
-    PolysomyResult,
+    FitRejection, PolysomyResult,
 };
-use rsomics_cnv::reports::{write_call_reports, write_polysomy_reports};
+use rsomics_cnv::reports::{
+    CallReportOptions, PolysomyReportOptions, write_call_reports, write_call_reports_with_options,
+    write_polysomy_reports, write_polysomy_reports_with_options,
+};
 use rsomics_cnv::signals::Measurement;
 
 fn result(control: bool) -> CallResult {
@@ -80,6 +83,12 @@ fn polysomy_result() -> PolysomyResult {
                     end_bin: 146,
                     absolute_deviation: 0.125,
                     function: "1.000000**2 * exp(-(x-0.500000)**2/0.040000**2)".to_owned(),
+                    fitted: (3..=146)
+                        .map(|index| DistributionBin {
+                            baf: index as f64 / 149.0,
+                            normalized_count: if index == 74 { 1.0 } else { 0.0 },
+                        })
+                        .collect(),
                 }],
             }],
         }],
@@ -152,6 +161,37 @@ fn optimized_call_reports_include_checked_estimates() {
 }
 
 #[test]
+fn call_plot_is_a_transactional_self_contained_svg() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("call-plot");
+    write_call_reports_with_options(
+        &output,
+        &result(false),
+        CallReportOptions {
+            plot_threshold: Some(0.0),
+        },
+    )
+    .unwrap();
+    let plot = std::fs::read_to_string(output.join("plot.QUERY.chr1.svg")).unwrap();
+    assert!(plot.starts_with("<svg"), "{plot}");
+    for label in ["LRR", "BAF", "Copy number", "chr1"] {
+        assert!(plot.contains(label), "missing {label}: {plot}");
+    }
+
+    let invalid = directory.path().join("invalid-plot");
+    let error = write_call_reports_with_options(
+        &invalid,
+        &result(false),
+        CallReportOptions {
+            plot_threshold: Some(f64::NAN),
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("plot threshold"), "{error}");
+    assert!(!invalid.exists());
+}
+
+#[test]
 fn paired_bundle_has_per_sample_and_joint_reports() {
     let directory = tempfile::tempdir().unwrap();
     let output = directory.path().join("reports");
@@ -189,6 +229,13 @@ fn failed_bundle_leaves_no_destination() {
     assert!(error.to_string().contains("sample name"), "{error}");
     assert!(!output.exists());
     assert!(!directory.path().join("escape").exists());
+
+    let empty_output = directory.path().join("empty-regions");
+    let mut empty_regions = result(false);
+    empty_regions.chromosomes[0].regions.clear();
+    let error = write_call_reports(&empty_output, &empty_regions).unwrap_err();
+    assert!(error.to_string().contains("sites or regions"), "{error}");
+    assert!(!empty_output.exists());
 }
 
 #[test]
@@ -229,6 +276,43 @@ fn polysomy_report_bundle_contains_compatibility_and_machine_results() {
         serde_json::from_slice(&fs::read(output.join("result.json")).unwrap()).unwrap();
     assert_eq!(json["schema"], "rsomics-cnv/polysomy-result/v1");
     assert_eq!(json["result"]["chromosomes"][0]["copy_number"], 2.0);
+    assert!(json["result"]["chromosomes"][0]["candidates"][0]["curves"][0]["fitted"].is_null());
+}
+
+#[test]
+fn polysomy_plots_include_distributions_and_copy_numbers() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("polysomy-plots");
+    write_polysomy_reports_with_options(
+        &output,
+        &polysomy_result(),
+        PolysomyReportOptions { plots: true },
+    )
+    .unwrap();
+    let distribution = std::fs::read_to_string(output.join("distribution.chr1.svg")).unwrap();
+    assert!(distribution.starts_with("<svg"), "{distribution}");
+    assert!(distribution.contains("BAF distribution"), "{distribution}");
+    let copy_number = std::fs::read_to_string(output.join("copy-number.svg")).unwrap();
+    assert!(copy_number.starts_with("<svg"), "{copy_number}");
+    assert!(copy_number.contains("Copy number"), "{copy_number}");
+
+    let unresolved_output = directory.path().join("unresolved-plots");
+    let mut unresolved = polysomy_result();
+    unresolved.chromosomes[0].copy_number = -1.0;
+    unresolved.chromosomes[0].absolute_deviation = None;
+    unresolved.chromosomes[0].candidates[0].selected = false;
+    unresolved.chromosomes[0].candidates[0].rejection = Some(FitRejection::FitThreshold);
+    write_polysomy_reports_with_options(
+        &unresolved_output,
+        &unresolved,
+        PolysomyReportOptions { plots: true },
+    )
+    .unwrap();
+    let distribution =
+        std::fs::read_to_string(unresolved_output.join("distribution.chr1.svg")).unwrap();
+    assert!(distribution.contains("unresolved"), "{distribution}");
+    let copy_number = std::fs::read_to_string(unresolved_output.join("copy-number.svg")).unwrap();
+    assert!(copy_number.contains("Unresolved"), "{copy_number}");
 }
 
 #[test]
