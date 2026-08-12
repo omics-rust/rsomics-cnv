@@ -43,8 +43,8 @@ memory. These are local equivalent-workflow measurements, not cross-platform
 claims; commands, raw measurements, fixture hashes, and compatibility checks
 are retained in [`benchmarks`](benchmarks/README.md).
 
-Unimplemented behavior is not exposed by the CLI. Publication remains gated on
-the final package review and exact-head four-platform CI.
+Unimplemented behavior is not exposed by the CLI. Every release requires a
+fresh package review and exact-head four-platform CI.
 
 The compatibility reference is bcftools 1.24 `cnv`, `polysomy`, `HMM.c`, and
 `peakfit.c`, retained under the upstream MIT license. Historical rsomics
