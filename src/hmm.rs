@@ -15,7 +15,31 @@ pub struct Hmm {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Inference {
     pub path: Vec<usize>,
-    pub posterior: Vec<Vec<f64>>,
+    states: usize,
+    posterior: Vec<f64>,
+}
+
+impl Inference {
+    pub fn states(&self) -> usize {
+        self.states
+    }
+
+    pub fn posterior(&self, site: usize) -> Option<&[f64]> {
+        let start = site.checked_mul(self.states)?;
+        self.posterior.get(start..start.checked_add(self.states)?)
+    }
+
+    pub fn posteriors(&self) -> impl ExactSizeIterator<Item = &[f64]> {
+        self.posterior.chunks_exact(self.states)
+    }
+
+    pub(crate) fn posterior_values(&self) -> &[f64] {
+        &self.posterior
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<usize>, usize, Vec<f64>) {
+        (self.path, self.states, self.posterior)
+    }
 }
 
 impl Hmm {
@@ -102,6 +126,20 @@ impl Hmm {
         positions: &[u32],
         emissions: &[[f64; N]],
     ) -> Result<Inference> {
+        let mut transitions = self.transition_cache(positions);
+        self.infer_cached(positions, emissions, &mut transitions)
+    }
+
+    pub(crate) fn transition_cache(&self, positions: &[u32]) -> TransitionCache {
+        TransitionCache::new(self.states, &self.transition, maximum_step(positions))
+    }
+
+    pub(crate) fn infer_cached<const N: usize>(
+        &self,
+        positions: &[u32],
+        emissions: &[[f64; N]],
+        transitions: &mut TransitionCache,
+    ) -> Result<Inference> {
         if N != self.states {
             return Err(invalid(format!(
                 "expected {} emission probabilities per site, found {N}",
@@ -117,6 +155,9 @@ impl Hmm {
         }
         if positions.is_empty() {
             return Err(invalid("HMM input has no sites"));
+        }
+        if transitions.states != self.states {
+            return Err(invalid("transition cache has the wrong state count"));
         }
         if positions.windows(2).any(|pair| pair[1] < pair[0]) {
             return Err(invalid("HMM positions must be sorted"));
@@ -139,11 +180,13 @@ impl Hmm {
             }
         }
 
-        let mut transitions =
-            TransitionCache::new(self.states, &self.transition, maximum_step(positions));
-        let (path, forward) = self.forward_viterbi(positions, emissions, &mut transitions)?;
-        let posterior = self.backward(positions, emissions, forward, &mut transitions)?;
-        Ok(Inference { path, posterior })
+        let (path, forward) = self.forward_viterbi(positions, emissions, transitions)?;
+        let posterior = self.backward(positions, emissions, forward, transitions)?;
+        Ok(Inference {
+            path,
+            states: self.states,
+            posterior,
+        })
     }
 
     fn forward_viterbi<const N: usize>(
@@ -151,45 +194,40 @@ impl Hmm {
         positions: &[u32],
         emissions: &[[f64; N]],
         transitions: &mut TransitionCache,
-    ) -> Result<(Vec<usize>, Vec<Vec<f64>>)> {
+    ) -> Result<(Vec<usize>, Vec<f64>)> {
         let count = positions.len();
-        let mut trace = vec![vec![0usize; self.states]; count];
+        let mut trace = vec![0usize; count * self.states];
         let mut viterbi = self.initial.clone();
-        let mut forward = Vec::with_capacity(count + 1);
-        forward.push(self.initial.clone());
+        let mut forward = Vec::with_capacity((count + 1) * self.states);
+        forward.extend_from_slice(&self.initial);
+        let mut next_viterbi = vec![0.0; self.states];
+        let mut next_forward = vec![0.0; self.states];
 
         for site in 0..count {
             let steps = step_count(positions, site);
             let transition = transitions.for_steps(steps);
-            let mut next_viterbi = vec![0.0; self.states];
-            let mut next_forward = vec![0.0; self.states];
+            let previous_forward = &forward[site * self.states..(site + 1) * self.states];
             for destination in 0..self.states {
                 let row = destination * self.states;
                 let mut best_source = 0;
                 let mut best = viterbi[0] * transition[row];
-                let mut total = forward[site][0] * transition[row];
+                let mut total = previous_forward[0] * transition[row];
                 for source in 1..self.states {
                     let probability = viterbi[source] * transition[row + source];
                     if probability > best {
                         best = probability;
                         best_source = source;
                     }
-                    total += forward[site][source] * transition[row + source];
+                    total += previous_forward[source] * transition[row + source];
                 }
-                trace[site][destination] = best_source;
+                trace[site * self.states + destination] = best_source;
                 next_viterbi[destination] = best * emissions[site][destination];
                 next_forward[destination] = total * emissions[site][destination];
             }
-            normalize(
-                &mut next_viterbi,
-                &format!("Viterbi probabilities at site {}", site + 1),
-            )?;
-            normalize(
-                &mut next_forward,
-                &format!("forward probabilities at site {}", site + 1),
-            )?;
-            viterbi = next_viterbi;
-            forward.push(next_forward);
+            normalize_site(&mut next_viterbi, "Viterbi probabilities", site)?;
+            normalize_site(&mut next_forward, "forward probabilities", site)?;
+            std::mem::swap(&mut viterbi, &mut next_viterbi);
+            forward.extend_from_slice(&next_forward);
         }
 
         let mut final_state = 0;
@@ -202,7 +240,7 @@ impl Hmm {
         let mut state = final_state;
         for site in (0..count).rev() {
             path[site] = state;
-            state = trace[site][state];
+            state = trace[site * self.states + state];
         }
         Ok((path, forward))
     }
@@ -211,22 +249,21 @@ impl Hmm {
         &self,
         positions: &[u32],
         emissions: &[[f64; N]],
-        forward: Vec<Vec<f64>>,
+        forward: Vec<f64>,
         transitions: &mut TransitionCache,
-    ) -> Result<Vec<Vec<f64>>> {
+    ) -> Result<Vec<f64>> {
         let count = positions.len();
-        let mut posterior = vec![vec![0.0; self.states]; count];
+        let mut posterior = vec![0.0; count * self.states];
         let mut backward = vec![1.0; self.states];
+        let mut next = vec![0.0; self.states];
         let mut previous_position = positions[count - 1];
 
         for site in (0..count).rev() {
+            let values = &mut posterior[site * self.states..(site + 1) * self.states];
             for state in 0..self.states {
-                posterior[site][state] = forward[site + 1][state] * backward[state];
+                values[state] = forward[(site + 1) * self.states + state] * backward[state];
             }
-            normalize(
-                &mut posterior[site],
-                &format!("posterior probabilities at site {}", site + 1),
-            )?;
+            normalize_site(values, "posterior probabilities", site)?;
 
             let steps = if positions[site] == previous_position {
                 1
@@ -235,7 +272,7 @@ impl Hmm {
             };
             previous_position = positions[site];
             let transition = transitions.for_steps(steps);
-            let mut next = vec![0.0; self.states];
+            next.fill(0.0);
             for source in 0..self.states {
                 for destination in 0..self.states {
                     next[source] += backward[destination]
@@ -243,11 +280,8 @@ impl Hmm {
                         * transition[destination * self.states + source];
                 }
             }
-            normalize(
-                &mut next,
-                &format!("backward probabilities at site {}", site + 1),
-            )?;
-            backward = next;
+            normalize_site(&mut next, "backward probabilities", site)?;
+            std::mem::swap(&mut backward, &mut next);
         }
         Ok(posterior)
     }
@@ -266,7 +300,7 @@ pub fn phred_error_probability(probability: f64) -> Result<f64> {
     }
 }
 
-struct TransitionCache {
+pub(crate) struct TransitionCache {
     states: usize,
     powers: Vec<Vec<f64>>,
     large: HashMap<u32, Vec<f64>>,
@@ -338,6 +372,20 @@ fn normalize(values: &mut [f64], name: &str) -> Result<()> {
     let sum: f64 = values.iter().sum();
     if !sum.is_finite() || sum <= 0.0 {
         return Err(invalid(format!("{name} have zero or non-finite mass")));
+    }
+    for value in values {
+        *value /= sum;
+    }
+    Ok(())
+}
+
+fn normalize_site(values: &mut [f64], name: &str, site: usize) -> Result<()> {
+    let sum: f64 = values.iter().sum();
+    if !sum.is_finite() || sum <= 0.0 {
+        return Err(invalid(format!(
+            "{name} at site {} have zero or non-finite mass",
+            site + 1
+        )));
     }
     for value in values {
         *value /= sum;

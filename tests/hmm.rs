@@ -41,7 +41,7 @@ fn inference_matches_the_bcftools_1_24_hmm_oracle() {
         .infer(&positions, &emissions)
         .unwrap();
     assert_eq!(result.path, [2, 2, 2, 2]);
-    for (actual, expected) in result.posterior.iter().zip(expected) {
+    for (actual, expected) in result.posteriors().zip(expected) {
         for (actual, expected) in actual.iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-14, "{actual} != {expected}");
         }
@@ -56,8 +56,10 @@ fn paired_prior_prefers_joint_diploid_state() {
         .infer(&[10], &emissions)
         .unwrap();
     assert_eq!(result.path, [10]);
-    assert_eq!(result.posterior[0].len(), 16);
-    assert!(result.posterior[0][10] > result.posterior[0][2]);
+    let posterior = result.posterior(0).unwrap();
+    assert_eq!(posterior.len(), 16);
+    assert!(posterior[10] > posterior[2]);
+    assert!(result.posterior(usize::MAX / result.states()).is_none());
 }
 
 #[test]

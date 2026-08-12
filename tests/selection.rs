@@ -48,6 +48,7 @@ fn write_polysomy_fixture(path: &Path) {
 }
 
 fn assert_cn_close(upstream: &Path, ours: &Path) {
+    let context = format!("{} versus {}", ours.display(), upstream.display());
     let upstream = std::fs::read_to_string(upstream).unwrap();
     let ours = std::fs::read_to_string(ours).unwrap();
     let upstream = upstream
@@ -62,11 +63,14 @@ fn assert_cn_close(upstream: &Path, ours: &Path) {
     for (ours, upstream) in ours.into_iter().zip(upstream) {
         let ours = ours.split('\t').collect::<Vec<_>>();
         let upstream = upstream.split('\t').collect::<Vec<_>>();
-        assert_eq!(&ours[..3], &upstream[..3]);
+        assert_eq!(&ours[..3], &upstream[..3], "{context}");
         for (ours, upstream) in ours[3..].iter().zip(&upstream[3..]) {
             let ours = ours.parse::<f64>().unwrap();
             let upstream = upstream.parse::<f64>().unwrap();
-            assert!((ours - upstream).abs() <= 1e-4, "{ours} != {upstream}");
+            assert!(
+                (ours - upstream).abs() <= 1e-4,
+                "{context}: {ours} != {upstream}"
+            );
         }
     }
 }
@@ -275,7 +279,16 @@ fn target_overlap_modes_match_bcftools_1_24() {
     ] {
         let upstream_output = directory.path().join(format!("bcftools-{value}"));
         let upstream = Command::new("bcftools")
-            .args(["cnv", "-s", "SAMPLE", "--targets-overlap", value, "-T"])
+            .args([
+                "cnv",
+                "-s",
+                "SAMPLE",
+                "-L",
+                "1",
+                "--targets-overlap",
+                value,
+                "-T",
+            ])
             .arg(&targets)
             .arg("-o")
             .arg(&upstream_output)
@@ -290,7 +303,10 @@ fn target_overlap_modes_match_bcftools_1_24() {
         let result = analyze_selected(
             &input,
             SampleSelection::default(),
-            CallOptions::default(),
+            CallOptions {
+                lrr_smoothing_window: 1,
+                ..CallOptions::default()
+            },
             &SiteSelection {
                 targets_file: Some(targets.clone()),
                 targets_overlap: overlap,
@@ -355,7 +371,16 @@ fn indexed_region_overlap_modes_match_bcftools_1_24() {
                 .path()
                 .join(format!("bcftools-{encoding}-{value}"));
             let upstream = Command::new("bcftools")
-                .args(["cnv", "-s", "SAMPLE", "--regions-overlap", value, "-R"])
+                .args([
+                    "cnv",
+                    "-s",
+                    "SAMPLE",
+                    "-L",
+                    "1",
+                    "--regions-overlap",
+                    value,
+                    "-R",
+                ])
                 .arg(&regions)
                 .arg("-o")
                 .arg(&upstream_output)
@@ -370,7 +395,10 @@ fn indexed_region_overlap_modes_match_bcftools_1_24() {
             let result = analyze_selected(
                 input,
                 SampleSelection::default(),
-                CallOptions::default(),
+                CallOptions {
+                    lrr_smoothing_window: 1,
+                    ..CallOptions::default()
+                },
                 &SiteSelection {
                     regions_file: Some(regions.clone()),
                     regions_overlap: overlap,

@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::allele_frequency::AlleleFrequencyReader;
 use crate::emission::{AlleleFrequencies, EmissionModel, EvidenceParameters, SampleParameters};
-use crate::hmm::{Hmm, Inference, phred_error_probability};
+use crate::hmm::{Hmm, Inference, TransitionCache, phred_error_probability};
 use crate::selection::{CompiledSelection, SiteSelection};
 use crate::signals::{Measurement, RequiredSignals, SampleSelection, SelectedSignalReader};
 
@@ -82,6 +82,14 @@ pub struct RegionCall {
     pub control_heterozygous_sites: Option<usize>,
 }
 
+pub(crate) struct CallAnalysisSummary {
+    pub sample: String,
+    pub control_sample: Option<String>,
+    pub chromosomes: usize,
+    pub sites: usize,
+    pub regions: usize,
+}
+
 struct CallEngine {
     query: SampleParameters,
     control: Option<SampleParameters>,
@@ -155,6 +163,55 @@ fn analyze_inner(
     allele_frequency_path: Option<&Path>,
     site_selection: &SiteSelection,
 ) -> Result<CallResult> {
+    let (summary, chromosomes) = analyze_each_inner(
+        input,
+        selection,
+        engine,
+        allele_frequency_path,
+        site_selection,
+        |_, _| Ok(Vec::new()),
+        |chromosomes, chromosome| {
+            chromosomes.push(chromosome);
+            Ok(())
+        },
+    )?;
+    Ok(CallResult {
+        sample: summary.sample,
+        control_sample: summary.control_sample,
+        chromosomes,
+    })
+}
+
+pub(crate) fn analyze_selected_into<T>(
+    input: &Path,
+    selection: SampleSelection,
+    options: CallOptions,
+    allele_frequency_path: Option<&Path>,
+    site_selection: &SiteSelection,
+    initialize: impl FnOnce(&str, Option<&str>) -> Result<T>,
+    consume: impl FnMut(&mut T, ChromosomeCall) -> Result<()>,
+) -> Result<(CallAnalysisSummary, T)> {
+    let paired = selection.control.is_some();
+    analyze_each_inner(
+        input,
+        selection,
+        CallEngine::new(options, paired)?,
+        allele_frequency_path,
+        site_selection,
+        initialize,
+        consume,
+    )
+}
+
+fn analyze_each_inner<T>(
+    input: &Path,
+    selection: SampleSelection,
+    engine: CallEngine,
+    allele_frequency_path: Option<&Path>,
+    site_selection: &SiteSelection,
+    initialize: impl FnOnce(&str, Option<&str>) -> Result<T>,
+    mut consume: impl FnMut(&mut T, ChromosomeCall) -> Result<()>,
+) -> Result<(CallAnalysisSummary, T)> {
     let required = if engine.evidence.lrr_weight == 0.0 {
         RequiredSignals::Baf
     } else {
@@ -167,7 +224,10 @@ fn analyze_inner(
         .transpose()?;
     let sample = reader.query_sample().to_owned();
     let control_sample = reader.control_sample().map(str::to_owned);
-    let mut chromosomes = Vec::new();
+    let mut sink = initialize(&sample, control_sample.as_deref())?;
+    let mut chromosome_count = 0;
+    let mut site_count = 0;
+    let mut region_count = 0;
     let mut current_name = None;
     let mut buffer = ChromosomeBuffer::default();
 
@@ -189,11 +249,11 @@ fn analyze_inner(
             .as_deref()
             .is_some_and(|name| name != site.reference_name)
         {
-            chromosomes.push(call_chromosome(
-                current_name.take().unwrap(),
-                &mut buffer,
-                &engine,
-            )?);
+            let chromosome = call_chromosome(current_name.take().unwrap(), &mut buffer, &engine)?;
+            chromosome_count += 1;
+            site_count += chromosome.sites.len();
+            region_count += chromosome.regions.len();
+            consume(&mut sink, chromosome)?;
         }
         current_name.get_or_insert(site.reference_name);
         buffer.positions.push(site.position);
@@ -205,22 +265,30 @@ fn analyze_inner(
         Ok(())
     })?;
     if let Some(reference_name) = current_name {
-        chromosomes.push(call_chromosome(reference_name, &mut buffer, &engine)?);
+        let chromosome = call_chromosome(reference_name, &mut buffer, &engine)?;
+        chromosome_count += 1;
+        site_count += chromosome.sites.len();
+        region_count += chromosome.regions.len();
+        consume(&mut sink, chromosome)?;
     }
     if let Some(reader) = allele_frequencies {
         reader.finish()?;
     }
-    if chromosomes.is_empty() {
+    if chromosome_count == 0 {
         return Err(invalid(
             "no informative BAF sites remain after sample selection",
         ));
     }
-
-    Ok(CallResult {
-        sample,
-        control_sample,
-        chromosomes,
-    })
+    Ok((
+        CallAnalysisSummary {
+            sample,
+            control_sample,
+            chromosomes: chromosome_count,
+            sites: site_count,
+            regions: region_count,
+        },
+        sink,
+    ))
 }
 
 impl CallEngine {
@@ -284,9 +352,19 @@ fn call_chromosome(
     } else {
         None
     };
+    let mut transitions = engine
+        .paired_hmm
+        .as_ref()
+        .unwrap_or(&engine.single_hmm)
+        .transition_cache(&buffer.positions);
 
-    let (query_parameters, control_parameters) =
-        optimize(buffer, &query_lrr, control_lrr.as_deref(), engine)?;
+    let (query_parameters, control_parameters) = optimize(
+        buffer,
+        &query_lrr,
+        control_lrr.as_deref(),
+        engine,
+        &mut transitions,
+    )?;
     let inference = infer(
         buffer,
         &query_lrr,
@@ -294,16 +372,16 @@ fn call_chromosome(
         engine,
         query_parameters,
         control_parameters,
+        &mut transitions,
     )?;
-    let path = inference.path;
-    let posterior = inference.posterior;
+    let (path, posterior_states, posterior) = inference.into_parts();
     let mut sites = Vec::with_capacity(buffer.positions.len());
     for (index, ((position, measurement), joint_posterior)) in buffer
         .positions
         .iter()
         .copied()
         .zip(buffer.query.iter().copied())
-        .zip(posterior)
+        .zip(posterior.chunks_exact(posterior_states))
         .enumerate()
     {
         let (copy_number, control_copy_number, state_probability, posterior, control_posterior) =
@@ -330,13 +408,12 @@ fn call_chromosome(
                     Some(control),
                 )
             } else {
-                let posterior: [f64; 4] =
-                    joint_posterior.try_into().map_err(|values: Vec<f64>| {
-                        invalid(format!(
-                            "HMM returned {} posterior states instead of 4",
-                            values.len()
-                        ))
-                    })?;
+                let posterior: [f64; 4] = joint_posterior.try_into().map_err(|_| {
+                    invalid(format!(
+                        "HMM returned {} posterior states instead of 4",
+                        joint_posterior.len()
+                    ))
+                })?;
                 (
                     u8::try_from(path[index])
                         .map_err(|_| invalid("copy-number state exceeds uint8"))?,
@@ -394,6 +471,7 @@ fn infer(
     engine: &CallEngine,
     query_parameters: SampleParameters,
     control_parameters: Option<SampleParameters>,
+    transitions: &mut TransitionCache,
 ) -> Result<Inference> {
     let query_model = EmissionModel::new(query_parameters, engine.evidence)?;
     let query_emissions = emissions(&query_model, &buffer.query, query_lrr, &buffer.frequencies)?;
@@ -423,9 +501,11 @@ fn infer(
                 joint
             })
             .collect::<Vec<_>>();
-        hmm.infer(&buffer.positions, &emissions)
+        hmm.infer_cached(&buffer.positions, &emissions, transitions)
     } else {
-        engine.single_hmm.infer(&buffer.positions, &query_emissions)
+        engine
+            .single_hmm
+            .infer_cached(&buffer.positions, &query_emissions, transitions)
     }
 }
 
@@ -451,6 +531,7 @@ fn optimize(
     query_lrr: &[Option<f64>],
     control_lrr: Option<&[Option<f64>]>,
     engine: &CallEngine,
+    transitions: &mut TransitionCache,
 ) -> Result<(SampleParameters, Option<SampleParameters>)> {
     let Some(minimum) = engine.optimization_minimum else {
         return Ok((engine.query, engine.control));
@@ -458,12 +539,20 @@ fn optimize(
     let mut query = engine.query;
     let mut control = engine.control;
     for iteration in 0..20 {
-        let inference = infer(buffer, query_lrr, control_lrr, engine, query, control)?;
+        let inference = infer(
+            buffer,
+            query_lrr,
+            control_lrr,
+            engine,
+            query,
+            control,
+            transitions,
+        )?;
         let query_converged = update_parameters(
             &buffer.query,
-            &inference.posterior,
+            inference.posterior_values(),
+            inference.states(),
             false,
-            engine.paired_hmm.is_some(),
             engine.query,
             &mut query,
             minimum,
@@ -471,8 +560,8 @@ fn optimize(
         let control_converged = if let Some(parameters) = &mut control {
             update_parameters(
                 &buffer.control,
-                &inference.posterior,
-                true,
+                inference.posterior_values(),
+                inference.states(),
                 true,
                 engine
                     .control
@@ -495,14 +584,14 @@ fn optimize(
 
 fn update_parameters(
     measurements: &[Measurement],
-    posterior: &[Vec<f64>],
+    posterior: &[f64],
+    posterior_states: usize,
     control: bool,
-    paired: bool,
     defaults: SampleParameters,
     parameters: &mut SampleParameters,
     minimum: f64,
 ) -> Result<bool> {
-    if measurements.len() != posterior.len() {
+    if measurements.len().checked_mul(posterior_states) != Some(posterior.len()) {
         return Err(invalid(
             "optimization posterior count differs from site count",
         ));
@@ -510,7 +599,10 @@ fn update_parameters(
     let mut values = Vec::new();
     let mut aa_variance = 0.0;
     let mut aa_count = 0usize;
-    for (measurement, probabilities) in measurements.iter().zip(posterior) {
+    for (measurement, probabilities) in measurements
+        .iter()
+        .zip(posterior.chunks_exact(posterior_states))
+    {
         let Some(mut baf) = measurement.baf else {
             continue;
         };
@@ -525,7 +617,10 @@ fn update_parameters(
         if baf < 0.2 {
             continue;
         }
-        values.push((baf, cn3_probability(probabilities, control, paired)?));
+        values.push((
+            baf,
+            cn3_probability(probabilities, control, posterior_states != 4)?,
+        ));
     }
     if values.is_empty() {
         parameters.aberrant_fraction = 1.0;

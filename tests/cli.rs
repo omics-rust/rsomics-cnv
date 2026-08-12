@@ -235,14 +235,12 @@ fn paired_call_accepts_distinct_control_model_parameters() {
         String::from_utf8_lossy(&shared_run.stderr)
     );
     let read_control_posterior = |output: &Path| {
-        let document: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(output.join("result.json")).unwrap()).unwrap();
-        document["result"]["chromosomes"][0]["sites"]
-            .as_array()
+        std::fs::read_to_string(output.join("cn.CONTROL.tab"))
             .unwrap()
-            .iter()
-            .flat_map(|site| site["control_posterior"].as_array().unwrap())
-            .map(|value| value.as_f64().unwrap())
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .flat_map(|line| line.split('\t').skip(3))
+            .map(|value| value.parse::<f64>().unwrap())
             .collect::<Vec<_>>()
     };
     let shared_posterior = read_control_posterior(&shared);

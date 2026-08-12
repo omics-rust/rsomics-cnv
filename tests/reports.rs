@@ -124,11 +124,17 @@ fn single_sample_report_bundle_is_complete() {
     assert!(summary.contains("RG\tchr1\t11\t11\t2\t10.4\t1\t1\n"));
     let json: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("result.json")).unwrap()).unwrap();
-    assert_eq!(json["schema"], "rsomics-cnv/call-result/v1");
+    assert_eq!(json["schema"], "rsomics-cnv/call-result/v2");
+    assert_eq!(json["result"]["chromosomes"][0]["sites"], 1);
     assert_eq!(
-        json["result"]["chromosomes"][0]["sites"][0]["modeled_lrr"],
-        -0.08
+        json["result"]["chromosomes"][0]["regions"][0]["copy_number"],
+        2
     );
+    assert_eq!(
+        json["result"]["artifacts"]["query"]["data"],
+        "dat.QUERY.tab"
+    );
+    assert!(json["result"]["chromosomes"][0]["posterior"].is_null());
 }
 
 #[test]

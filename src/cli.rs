@@ -6,14 +6,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use rsomics_common::{OutputArgs, Result, RsomicsError, ToolMeta, run as run_tool};
 use serde::Serialize;
 
-use crate::call::{
-    CallOptions, analyze_selected as analyze_calls, analyze_with_allele_frequencies_selected,
-};
+use crate::call::{CallOptions, analyze_selected_into};
 use crate::emission::{EvidenceParameters, SampleParameters};
 use crate::polysomy::{PolysomyOptions, analyze_selected as analyze_polysomy};
 use crate::reports::{
-    CallReportOptions, PolysomyReportOptions, write_call_reports_with_options,
-    write_polysomy_reports_with_options,
+    CallReportOptions, CallReportWriter, PolysomyReportOptions, write_polysomy_reports_with_options,
 };
 use crate::selection::{OverlapMode, SiteSelection};
 use crate::signals::SampleSelection;
@@ -342,43 +339,28 @@ fn execute(command: Command) -> Result<RunSummary> {
                 lrr_smoothing_window: args.lrr_smoothing_window,
                 optimize_aberrant_fraction: args.optimize_aberrant_fraction,
             };
-            let result = if let Some(frequencies) = args.allele_frequencies {
-                analyze_with_allele_frequencies_selected(
-                    &args.input,
-                    selection,
-                    options,
-                    &frequencies,
-                    &site_selection,
-                )?
-            } else {
-                analyze_calls(&args.input, selection, options, &site_selection)?
+            let report_options = CallReportOptions {
+                plot_threshold: args.plot_threshold,
             };
-            write_call_reports_with_options(
-                &args.output,
-                &result,
-                CallReportOptions {
-                    plot_threshold: args.plot_threshold,
+            let (summary, writer) = analyze_selected_into(
+                &args.input,
+                selection,
+                options,
+                args.allele_frequencies.as_deref(),
+                &site_selection,
+                |sample, control| {
+                    CallReportWriter::new(&args.output, sample, control, report_options)
                 },
+                |writer, chromosome| writer.write_chromosome(&chromosome),
             )?;
+            writer.finish()?;
             Ok(RunSummary {
                 workflow: "call",
-                sample: result.sample,
+                sample: summary.sample,
                 output: args.output,
-                chromosomes: result.chromosomes.len(),
-                sites: Some(
-                    result
-                        .chromosomes
-                        .iter()
-                        .map(|chromosome| chromosome.sites.len())
-                        .sum(),
-                ),
-                regions: Some(
-                    result
-                        .chromosomes
-                        .iter()
-                        .map(|chromosome| chromosome.regions.len())
-                        .sum(),
-                ),
+                chromosomes: summary.chromosomes,
+                sites: Some(summary.sites),
+                regions: Some(summary.regions),
             })
         }
         Command::Polysomy(args) => {

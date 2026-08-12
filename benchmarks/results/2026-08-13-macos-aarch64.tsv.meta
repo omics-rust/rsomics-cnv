@@ -1,0 +1,14 @@
+Darwin Snaixs-Mac-Mini.local 25.6.0 Darwin Kernel Version 25.6.0: Sat Jul 11 15:27:02 PDT 2026; root:xnu-12377.161.13~4/RELEASE_ARM64_T8112 arm64
+ProductName:		macOS
+ProductVersion:		26.6.1
+BuildVersion:		25G76
+Apple M2
+bcftools 1.24
+Using htslib 1.24
+rsomics-cnv 0.1.0
+8ed39f9cd9b9957b85e5c125c374d2e87e22ccd2588cfcd28b68a58bfdd090ad  /Volumes/KIOXIA/Developments/cargo-target/rsomics-cnv/release/rsomics-cnv
+fb5b1fa37ea19d60fafe12320a5fa8edfb18c65e732f46b0a080d3f9b8a4eb76  /Volumes/Zane's HDD/rsomics-fixtures/cnv/release-gate-20260812/formal/call.vcf
+b15942724f7e47c8648830125400b5bf4c2eb1f446a09f863e4af71a358b8c1d  /Volumes/Zane's HDD/rsomics-fixtures/cnv/release-gate-20260812/formal/polysomy.vcf
+call records	300000
+polysomy records	300000
+rounds	12

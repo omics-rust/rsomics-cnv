@@ -15,39 +15,52 @@ pub(crate) fn for_each_call_plot(
     minimum_quality: f64,
     mut output: impl FnMut(String, String) -> Result<()>,
 ) -> Result<()> {
+    for chromosome in &result.chromosomes {
+        if let Some((name, svg)) = call_plot(
+            chromosome,
+            &result.sample,
+            result.control_sample.as_deref(),
+            minimum_quality,
+        )? {
+            output(name, svg)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn call_plot(
+    chromosome: &ChromosomeCall,
+    query: &str,
+    control: Option<&str>,
+    minimum_quality: f64,
+) -> Result<Option<(String, String)>> {
     if !minimum_quality.is_finite() || minimum_quality < 0.0 {
         return Err(invalid(
             "plot threshold must be finite and greater than or equal to zero",
         ));
     }
-    for chromosome in &result.chromosomes {
-        let maximum = chromosome
-            .regions
-            .iter()
-            .map(|region| region.quality)
-            .fold(f64::NEG_INFINITY, f64::max);
-        if maximum < minimum_quality {
-            continue;
-        }
-        let name = match result.control_sample.as_deref() {
-            Some(control) => format!(
-                "plot.{}.{}.{}.svg",
-                filename_component(control),
-                filename_component(&result.sample),
-                filename_component(&chromosome.reference_name)
-            ),
-            None => format!(
-                "plot.{}.{}.svg",
-                filename_component(&result.sample),
-                filename_component(&chromosome.reference_name)
-            ),
-        };
-        output(
-            name,
-            render_call(chromosome, &result.sample, result.control_sample.as_deref())?,
-        )?;
+    let maximum = chromosome
+        .regions
+        .iter()
+        .map(|region| region.quality)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if maximum < minimum_quality {
+        return Ok(None);
     }
-    Ok(())
+    let name = match control {
+        Some(control) => format!(
+            "plot.{}.{}.{}.svg",
+            filename_component(control),
+            filename_component(query),
+            filename_component(&chromosome.reference_name)
+        ),
+        None => format!(
+            "plot.{}.{}.svg",
+            filename_component(query),
+            filename_component(&chromosome.reference_name)
+        ),
+    };
+    Ok(Some((name, render_call(chromosome, query, control)?)))
 }
 
 pub(crate) fn for_each_polysomy_plot(

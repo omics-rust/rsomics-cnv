@@ -12,9 +12,12 @@ Both commands accept VCF, BGZF-compressed VCF, BCF, and BGZF-compressed BCF.
 They fail on malformed signals, unsorted records, ambiguous sample selection,
 invalid model parameters, and an existing output directory. Report bundles are
 committed as a complete directory and include a versioned JSON result alongside
-the compatibility tables. `--json` emits the shared rsomics command envelope to
-standard output. `call --allele-frequencies` accepts plain or gzip-compressed
-`CHROM`, `POS`, `REF,ALT`, `AF` tables and restricts inference to listed sites.
+the compatibility tables. The `call-result/v2` JSON is a compact artifact
+manifest with chromosome and region summaries; per-site measurements and
+posteriors remain in the compatibility tables instead of being duplicated in
+JSON. `--json` emits the shared rsomics command envelope to standard output.
+`call --allele-frequencies` accepts plain or gzip-compressed `CHROM`, `POS`,
+`REF,ALT`, `AF` tables and restricts inference to listed sites.
 
 Both operations accept inline or file-backed regions and targets. Regions use
 TBI or CSI index jumps over BGZF VCF or BCF; targets stream over every accepted
@@ -33,9 +36,15 @@ the requested region quality. `polysomy --plots` adds fitted BAF-distribution
 SVGs and a chromosome copy-number overview. The plots are self-contained and
 do not require Python or a plotting runtime.
 
-The crate remains unpublished while representative equivalent-workflow timing
-and peak-memory measurements are completed. Unimplemented behavior is not
-exposed by the CLI.
+The CLI infers, writes, and releases one chromosome at a time. On the tracked
+300,000-site macOS arm64 release gate, `call` used 32.1% less peak memory than
+bcftools 1.24 and `polysomy` was 4.4 times faster while using 49.7% less peak
+memory. These are local equivalent-workflow measurements, not cross-platform
+claims; commands, raw measurements, fixture hashes, and compatibility checks
+are retained in [`benchmarks`](benchmarks/README.md).
+
+Unimplemented behavior is not exposed by the CLI. Publication remains gated on
+the final package review and exact-head four-platform CI.
 
 The compatibility reference is bcftools 1.24 `cnv`, `polysomy`, `HMM.c`, and
 `peakfit.c`, retained under the upstream MIT license. Historical rsomics

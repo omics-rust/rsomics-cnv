@@ -6,9 +6,13 @@ use std::path::{Path, PathBuf};
 use rsomics_common::{Context, Result, RsomicsError};
 use serde::Serialize;
 
-use crate::call::{CallResult, ChromosomeCall};
-use crate::plots::{for_each_call_plot, for_each_polysomy_plot};
+use crate::call::{AberrantEstimate, CallResult, ChromosomeCall, RegionCall};
+use crate::plots::{call_plot, for_each_call_plot, for_each_polysomy_plot};
 use crate::polysomy::{BINS, PolysomyResult};
+
+mod streaming;
+
+pub(crate) use streaming::CallReportWriter;
 
 const DAT_HEADER: &str = "# [1]Chromosome\t[2]Position\t[3]BAF\t[4]LRR\n";
 const CN_HEADER: &str =
@@ -27,6 +31,38 @@ struct ResultDocument<'a, T> {
 struct Producer {
     name: &'static str,
     version: &'static str,
+}
+
+#[derive(Serialize)]
+struct CallReport {
+    sample: String,
+    control_sample: Option<String>,
+    chromosomes: Vec<CallChromosomeReport>,
+    artifacts: CallArtifacts,
+    plot_threshold: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct CallChromosomeReport {
+    reference_name: String,
+    sites: usize,
+    regions: Vec<RegionCall>,
+    query_estimate: Option<AberrantEstimate>,
+    control_estimate: Option<AberrantEstimate>,
+}
+
+#[derive(Serialize)]
+struct CallArtifacts {
+    query: SampleArtifacts,
+    control: Option<SampleArtifacts>,
+    joint_summary: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SampleArtifacts {
+    data: String,
+    copy_number: String,
+    summary: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -59,8 +95,8 @@ pub fn write_call_reports_with_options(
         }
         write_json(
             directory.join("result.json"),
-            "rsomics-cnv/call-result/v1",
-            result,
+            "rsomics-cnv/call-result/v2",
+            &call_report(result, options),
         )?;
         if let Some(threshold) = options.plot_threshold {
             for_each_call_plot(result, threshold, |name, svg| {
@@ -69,6 +105,38 @@ pub fn write_call_reports_with_options(
         }
         Ok(())
     })
+}
+
+fn call_report(result: &CallResult, options: CallReportOptions) -> CallReport {
+    let sample_artifacts = |sample: &str| SampleArtifacts {
+        data: format!("dat.{sample}.tab"),
+        copy_number: format!("cn.{sample}.tab"),
+        summary: format!("summary.{sample}.tab"),
+    };
+    CallReport {
+        sample: result.sample.clone(),
+        control_sample: result.control_sample.clone(),
+        chromosomes: result
+            .chromosomes
+            .iter()
+            .map(|chromosome| CallChromosomeReport {
+                reference_name: chromosome.reference_name.clone(),
+                sites: chromosome.sites.len(),
+                regions: chromosome.regions.clone(),
+                query_estimate: chromosome.query_estimate,
+                control_estimate: chromosome.control_estimate,
+            })
+            .collect(),
+        artifacts: CallArtifacts {
+            query: sample_artifacts(&result.sample),
+            control: result.control_sample.as_deref().map(sample_artifacts),
+            joint_summary: result
+                .control_sample
+                .as_ref()
+                .map(|_| "summary.tab".to_owned()),
+        },
+        plot_threshold: options.plot_threshold,
+    }
 }
 
 pub fn write_polysomy_reports(output: &Path, result: &PolysomyResult) -> Result<()> {
@@ -104,6 +172,12 @@ fn write_plot(directory: &Path, name: String, svg: String) -> Result<()> {
 }
 
 fn write_report_directory(output: &Path, body: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    let stage = create_report_directory(output)?;
+    body(stage.path())?;
+    commit_report_directory(stage, output)
+}
+
+fn create_report_directory(output: &Path) -> Result<tempfile::TempDir> {
     if output.exists() {
         return Err(RsomicsError::ConfigError(format!(
             "output directory {} already exists",
@@ -115,7 +189,11 @@ fn write_report_directory(output: &Path, body: impl FnOnce(&Path) -> Result<()>)
         .prefix(".rsomics-cnv-")
         .tempdir_in(parent)
         .rs_with_context(|| format!("staging report directory beside {}", output.display()))?;
-    body(stage.path())?;
+    Ok(stage)
+}
+
+fn commit_report_directory(stage: tempfile::TempDir, output: &Path) -> Result<()> {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
     File::open(stage.path())
         .and_then(|directory| directory.sync_all())
         .rs_with_context(|| format!("syncing staged reports for {}", output.display()))?;
@@ -219,23 +297,32 @@ fn write_data(writer: &mut dyn Write, chromosomes: &[ChromosomeCall], control: b
         .write_all(DAT_HEADER.as_bytes())
         .map_err(RsomicsError::Io)?;
     for chromosome in chromosomes {
-        for site in &chromosome.sites {
-            let measurement = if control {
-                site.control_measurement
-                    .ok_or_else(|| inconsistent("missing control measurement"))?
-            } else {
-                site.measurement
-            };
-            if let Some(baf) = measurement.baf {
-                writeln!(
-                    writer,
-                    "{}\t{}\t{baf:.3}\t{:.3}",
-                    chromosome.reference_name,
-                    site.position,
-                    measurement.lrr.unwrap_or(0.0)
-                )
-                .map_err(RsomicsError::Io)?;
-            }
+        write_data_chromosome(writer, chromosome, control)?;
+    }
+    Ok(())
+}
+
+fn write_data_chromosome(
+    writer: &mut dyn Write,
+    chromosome: &ChromosomeCall,
+    control: bool,
+) -> Result<()> {
+    for site in &chromosome.sites {
+        let measurement = if control {
+            site.control_measurement
+                .ok_or_else(|| inconsistent("missing control measurement"))?
+        } else {
+            site.measurement
+        };
+        if let Some(baf) = measurement.baf {
+            writeln!(
+                writer,
+                "{}\t{}\t{baf:.3}\t{:.3}",
+                chromosome.reference_name,
+                site.position,
+                measurement.lrr.unwrap_or(0.0)
+            )
+            .map_err(RsomicsError::Io)?;
         }
     }
     Ok(())
@@ -250,30 +337,39 @@ fn write_copy_number(
         .write_all(CN_HEADER.as_bytes())
         .map_err(RsomicsError::Io)?;
     for chromosome in chromosomes {
-        for site in &chromosome.sites {
-            let (copy_number, posterior) = if control {
-                (
-                    site.control_copy_number
-                        .ok_or_else(|| inconsistent("missing control copy-number state"))?,
-                    site.control_posterior
-                        .ok_or_else(|| inconsistent("missing control posterior"))?,
-                )
-            } else {
-                (site.copy_number, site.posterior)
-            };
-            writeln!(
-                writer,
-                "{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
-                chromosome.reference_name,
-                site.position,
-                copy_number,
-                posterior[0],
-                posterior[1],
-                posterior[2],
-                posterior[3]
+        write_copy_number_chromosome(writer, chromosome, control)?;
+    }
+    Ok(())
+}
+
+fn write_copy_number_chromosome(
+    writer: &mut dyn Write,
+    chromosome: &ChromosomeCall,
+    control: bool,
+) -> Result<()> {
+    for site in &chromosome.sites {
+        let (copy_number, posterior) = if control {
+            (
+                site.control_copy_number
+                    .ok_or_else(|| inconsistent("missing control copy-number state"))?,
+                site.control_posterior
+                    .ok_or_else(|| inconsistent("missing control posterior"))?,
             )
-            .map_err(RsomicsError::Io)?;
-        }
+        } else {
+            (site.copy_number, site.posterior)
+        };
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+            chromosome.reference_name,
+            site.position,
+            copy_number,
+            posterior[0],
+            posterior[1],
+            posterior[2],
+            posterior[3]
+        )
+        .map_err(RsomicsError::Io)?;
     }
     Ok(())
 }
@@ -283,57 +379,72 @@ fn write_summary(
     chromosomes: &[ChromosomeCall],
     control: bool,
 ) -> Result<()> {
-    writer
-        .write_all(SUMMARY_HEADER.as_bytes())
-        .map_err(RsomicsError::Io)?;
-    if chromosomes.iter().any(|chromosome| {
+    let optimized = chromosomes.iter().any(|chromosome| {
         if control {
             chromosome.control_estimate.is_some()
         } else {
             chromosome.query_estimate.is_some()
         }
-    }) {
+    });
+    write_sample_summary_header(writer, optimized)?;
+    for chromosome in chromosomes {
+        write_summary_chromosome(writer, chromosome, control)?;
+    }
+    Ok(())
+}
+
+fn write_sample_summary_header(writer: &mut dyn Write, optimized: bool) -> Result<()> {
+    writer
+        .write_all(SUMMARY_HEADER.as_bytes())
+        .map_err(RsomicsError::Io)?;
+    if optimized {
         writer
             .write_all(ESTIMATE_HEADER.as_bytes())
             .map_err(RsomicsError::Io)?;
     }
-    for chromosome in chromosomes {
-        let estimate = if control {
-            chromosome.control_estimate
+    Ok(())
+}
+
+fn write_summary_chromosome(
+    writer: &mut dyn Write,
+    chromosome: &ChromosomeCall,
+    control: bool,
+) -> Result<()> {
+    let estimate = if control {
+        chromosome.control_estimate
+    } else {
+        chromosome.query_estimate
+    };
+    if let Some(estimate) = estimate {
+        write_estimate(writer, chromosome, estimate)?;
+    }
+    for region in &chromosome.regions {
+        let copy_number = if control {
+            region
+                .control_copy_number
+                .ok_or_else(|| inconsistent("missing control region state"))?
         } else {
-            chromosome.query_estimate
+            region.copy_number
         };
-        if let Some(estimate) = estimate {
-            write_estimate(writer, chromosome, estimate)?;
-        }
-        for region in &chromosome.regions {
-            let copy_number = if control {
-                region
-                    .control_copy_number
-                    .ok_or_else(|| inconsistent("missing control region state"))?
-            } else {
-                region.copy_number
-            };
-            let heterozygous_sites = if control {
-                region
-                    .control_heterozygous_sites
-                    .ok_or_else(|| inconsistent("missing control heterozygous-site count"))?
-            } else {
-                region.heterozygous_sites
-            };
-            writeln!(
-                writer,
-                "RG\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{}",
-                chromosome.reference_name,
-                region.start,
-                region.end,
-                copy_number,
-                region.quality,
-                region.sites,
-                heterozygous_sites
-            )
-            .map_err(RsomicsError::Io)?;
-        }
+        let heterozygous_sites = if control {
+            region
+                .control_heterozygous_sites
+                .ok_or_else(|| inconsistent("missing control heterozygous-site count"))?
+        } else {
+            region.heterozygous_sites
+        };
+        writeln!(
+            writer,
+            "RG\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{}",
+            chromosome.reference_name,
+            region.start,
+            region.end,
+            copy_number,
+            region.quality,
+            region.sites,
+            heterozygous_sites
+        )
+        .map_err(RsomicsError::Io)?;
     }
     Ok(())
 }
@@ -343,64 +454,80 @@ fn write_joint_summary(writer: &mut dyn Write, result: &CallResult) -> Result<()
         .control_sample
         .as_deref()
         .ok_or_else(|| inconsistent("missing control sample"))?;
-    writeln!(
-        writer,
-        "# RG, Regions\t[2]Chromosome\t[3]Start\t[4]End\t[5]Copy number:{}\t[6]Copy number:{}\t[7]Quality\t[8]nSites in (5)\t[9]nHETs in (5)\t[10]nSites in (6)\t[11]nHETs in (6)",
-        result.sample, control
-    )
-    .map_err(RsomicsError::Io)?;
-    if result
+    let optimized = result
         .chromosomes
         .iter()
-        .any(|chromosome| chromosome.query_estimate.is_some())
-    {
+        .any(|chromosome| chromosome.query_estimate.is_some());
+    write_joint_summary_header(writer, &result.sample, control, optimized)?;
+    for chromosome in &result.chromosomes {
+        write_joint_summary_chromosome(writer, chromosome)?;
+    }
+    Ok(())
+}
+
+fn write_joint_summary_header(
+    writer: &mut dyn Write,
+    sample: &str,
+    control: &str,
+    optimized: bool,
+) -> Result<()> {
+    writeln!(
+        writer,
+        "# RG, Regions\t[2]Chromosome\t[3]Start\t[4]End\t[5]Copy number:{sample}\t[6]Copy number:{control}\t[7]Quality\t[8]nSites in (5)\t[9]nHETs in (5)\t[10]nSites in (6)\t[11]nHETs in (6)"
+    )
+    .map_err(RsomicsError::Io)?;
+    if optimized {
         writeln!(
             writer,
-            "# CF, cell fraction estimate\t[2]Chromosome\t[3]Start\t[4]End\t[5]Cell fraction:{}\t[6]Cell fraction:{}\t[7]BAF deviation:{}\t[8]BAF deviation:{}",
-            result.sample, control, result.sample, control
+            "# CF, cell fraction estimate\t[2]Chromosome\t[3]Start\t[4]End\t[5]Cell fraction:{sample}\t[6]Cell fraction:{control}\t[7]BAF deviation:{sample}\t[8]BAF deviation:{control}"
         )
         .map_err(RsomicsError::Io)?;
     }
-    for chromosome in &result.chromosomes {
-        if let Some(query) = chromosome.query_estimate {
-            let control = chromosome
-                .control_estimate
-                .ok_or_else(|| inconsistent("missing control aberrant-fraction estimate"))?;
-            let (start, end) = chromosome_bounds(chromosome)?;
-            writeln!(
-                writer,
-                "CF\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.6}\t{:.6}",
-                chromosome.reference_name,
-                start,
-                end,
-                query.fraction,
-                control.fraction,
-                query.baf_deviation,
-                control.baf_deviation
-            )
-            .map_err(RsomicsError::Io)?;
-        }
-        for region in &chromosome.regions {
-            writeln!(
-                writer,
-                "RG\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{}\t{}\t{}",
-                chromosome.reference_name,
-                region.start,
-                region.end,
-                region.copy_number,
-                region
-                    .control_copy_number
-                    .ok_or_else(|| inconsistent("missing control region state"))?,
-                region.quality,
-                region.sites,
-                region.heterozygous_sites,
-                region.sites,
-                region
-                    .control_heterozygous_sites
-                    .ok_or_else(|| inconsistent("missing control heterozygous-site count"))?
-            )
-            .map_err(RsomicsError::Io)?;
-        }
+    Ok(())
+}
+
+fn write_joint_summary_chromosome(
+    writer: &mut dyn Write,
+    chromosome: &ChromosomeCall,
+) -> Result<()> {
+    if let Some(query) = chromosome.query_estimate {
+        let control = chromosome
+            .control_estimate
+            .ok_or_else(|| inconsistent("missing control aberrant-fraction estimate"))?;
+        let (start, end) = chromosome_bounds(chromosome)?;
+        writeln!(
+            writer,
+            "CF\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.6}\t{:.6}",
+            chromosome.reference_name,
+            start,
+            end,
+            query.fraction,
+            control.fraction,
+            query.baf_deviation,
+            control.baf_deviation
+        )
+        .map_err(RsomicsError::Io)?;
+    }
+    for region in &chromosome.regions {
+        writeln!(
+            writer,
+            "RG\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{}\t{}\t{}",
+            chromosome.reference_name,
+            region.start,
+            region.end,
+            region.copy_number,
+            region
+                .control_copy_number
+                .ok_or_else(|| inconsistent("missing control region state"))?,
+            region.quality,
+            region.sites,
+            region.heterozygous_sites,
+            region.sites,
+            region
+                .control_heterozygous_sites
+                .ok_or_else(|| inconsistent("missing control heterozygous-site count"))?
+        )
+        .map_err(RsomicsError::Io)?;
     }
     Ok(())
 }
@@ -461,48 +588,71 @@ fn validate_call_result(result: &CallResult) -> Result<()> {
     let optimized = result.chromosomes[0].query_estimate.is_some();
     let mut references = HashSet::new();
     for chromosome in &result.chromosomes {
-        if chromosome.reference_name.is_empty()
-            || !references.insert(chromosome.reference_name.as_str())
-        {
-            return Err(inconsistent("reference names are empty or duplicated"));
+        validate_call_chromosome(
+            chromosome,
+            result.control_sample.is_some(),
+            Some(optimized),
+            &mut references,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_call_chromosome(
+    chromosome: &ChromosomeCall,
+    paired: bool,
+    optimized: Option<bool>,
+    references: &mut HashSet<String>,
+) -> Result<()> {
+    if chromosome.reference_name.is_empty() || !references.insert(chromosome.reference_name.clone())
+    {
+        return Err(inconsistent("reference names are empty or duplicated"));
+    }
+    if chromosome.sites.is_empty() || chromosome.regions.is_empty() {
+        return Err(inconsistent(format!(
+            "{} has no sites or regions",
+            chromosome.reference_name
+        )));
+    }
+    if optimized.is_some_and(|optimized| chromosome.query_estimate.is_some() != optimized) {
+        return Err(inconsistent(
+            "query aberrant-fraction estimates are incomplete",
+        ));
+    }
+    if paired {
+        if chromosome.control_estimate.is_some() != chromosome.query_estimate.is_some() {
+            return Err(inconsistent(
+                "control aberrant-fraction estimates are incomplete",
+            ));
         }
-        if chromosome.sites.is_empty() || chromosome.regions.is_empty() {
+    } else if chromosome.control_estimate.is_some() {
+        return Err(inconsistent(
+            "control estimate is present without a control sample",
+        ));
+    }
+    for estimate in [chromosome.query_estimate, chromosome.control_estimate]
+        .into_iter()
+        .flatten()
+    {
+        if !estimate.fraction.is_finite()
+            || !(0.0..=1.0).contains(&estimate.fraction)
+            || !estimate.baf_deviation.is_finite()
+            || estimate.baf_deviation <= 0.0
+        {
             return Err(inconsistent(format!(
-                "{} has no sites or regions",
+                "{} has an invalid aberrant-fraction estimate",
                 chromosome.reference_name
             )));
         }
-        if chromosome.query_estimate.is_some() != optimized {
-            return Err(inconsistent(
-                "query aberrant-fraction estimates are incomplete",
-            ));
-        }
-        if result.control_sample.is_some() {
-            if chromosome.control_estimate.is_some() != optimized {
-                return Err(inconsistent(
-                    "control aberrant-fraction estimates are incomplete",
-                ));
-            }
-        } else if chromosome.control_estimate.is_some() {
-            return Err(inconsistent(
-                "control estimate is present without a control sample",
-            ));
-        }
-        for estimate in [chromosome.query_estimate, chromosome.control_estimate]
-            .into_iter()
-            .flatten()
-        {
-            if !estimate.fraction.is_finite()
-                || !(0.0..=1.0).contains(&estimate.fraction)
-                || !estimate.baf_deviation.is_finite()
-                || estimate.baf_deviation <= 0.0
-            {
-                return Err(inconsistent(format!(
-                    "{} has an invalid aberrant-fraction estimate",
-                    chromosome.reference_name
-                )));
-            }
-        }
+    }
+    Ok(())
+}
+
+fn validate_plot_threshold(threshold: Option<f64>) -> Result<()> {
+    if threshold.is_some_and(|value| !value.is_finite() || value < 0.0) {
+        return Err(RsomicsError::InvalidInput(
+            "plot threshold must be finite and greater than or equal to zero".to_owned(),
+        ));
     }
     Ok(())
 }
