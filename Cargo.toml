@@ -1,0 +1,27 @@
+[package]
+name = "rsomics-cnv"
+version = "0.1.0"
+description = "BAF and LRR copy-number analysis workflows"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/omics-rust/rsomics-cnv"
+homepage = "https://github.com/omics-rust/rsomics-cnv"
+documentation = "https://docs.rs/rsomics-cnv"
+authors = ["Zane Leong <efd@live.com>"]
+categories = ["science", "command-line-utilities"]
+keywords = ["bioinformatics", "cnv", "genomics", "vcf", "bcf"]
+readme = "README.md"
+
+[lib]
+doctest = false
+
+[dependencies]
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+noodles-bcf = "0.88"
+noodles-vcf = "0.90"
+rsomics-common = "0.12"
+
+[dev-dependencies]
+noodles-bgzf = "0.49"
+tempfile = "3"
