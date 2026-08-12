@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -6,6 +7,7 @@ use rsomics_common::{Context, Result, RsomicsError};
 use serde::Serialize;
 
 use crate::call::{CallResult, ChromosomeCall};
+use crate::polysomy::{BINS, PolysomyResult};
 
 const DAT_HEADER: &str = "# [1]Chromosome\t[2]Position\t[3]BAF\t[4]LRR\n";
 const CN_HEADER: &str =
@@ -13,10 +15,10 @@ const CN_HEADER: &str =
 const SUMMARY_HEADER: &str = "# RG, Regions\t[2]Chromosome\t[3]Start\t[4]End\t[5]Copy Number state\t[6]Quality\t[7]nSites\t[8]nHETs\n";
 
 #[derive(Serialize)]
-struct ResultDocument<'a> {
+struct ResultDocument<'a, T> {
     schema: &'static str,
     producer: Producer,
-    result: &'a CallResult,
+    result: &'a T,
 }
 
 #[derive(Serialize)]
@@ -26,7 +28,38 @@ struct Producer {
 }
 
 pub fn write_call_reports(output: &Path, result: &CallResult) -> Result<()> {
-    validate_result(result)?;
+    validate_call_result(result)?;
+    write_report_directory(output, |directory| {
+        write_sample_reports(directory, result, false)?;
+        if result.control_sample.is_some() {
+            write_sample_reports(directory, result, true)?;
+            write_file(directory.join("summary.tab"), |writer| {
+                write_joint_summary(writer, result)
+            })?;
+        }
+        write_json(
+            directory.join("result.json"),
+            "rsomics-cnv/call-result/v1",
+            result,
+        )
+    })
+}
+
+pub fn write_polysomy_reports(output: &Path, result: &PolysomyResult) -> Result<()> {
+    validate_polysomy_result(result)?;
+    write_report_directory(output, |directory| {
+        write_file(directory.join("dist.dat"), |writer| {
+            write_polysomy_compatibility(writer, result)
+        })?;
+        write_json(
+            directory.join("result.json"),
+            "rsomics-cnv/polysomy-result/v1",
+            result,
+        )
+    })
+}
+
+fn write_report_directory(output: &Path, body: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     if output.exists() {
         return Err(RsomicsError::ConfigError(format!(
             "output directory {} already exists",
@@ -38,27 +71,7 @@ pub fn write_call_reports(output: &Path, result: &CallResult) -> Result<()> {
         .prefix(".rsomics-cnv-")
         .tempdir_in(parent)
         .rs_with_context(|| format!("staging report directory beside {}", output.display()))?;
-
-    write_sample_reports(stage.path(), result, false)?;
-    if result.control_sample.is_some() {
-        write_sample_reports(stage.path(), result, true)?;
-        write_file(stage.path().join("summary.tab"), |writer| {
-            write_joint_summary(writer, result)
-        })?;
-    }
-    write_file(stage.path().join("result.json"), |writer| {
-        let document = ResultDocument {
-            schema: "rsomics-cnv/call-result/v1",
-            producer: Producer {
-                name: "rsomics-cnv",
-                version: env!("CARGO_PKG_VERSION"),
-            },
-            result,
-        };
-        serde_json::to_writer_pretty(&mut *writer, &document)
-            .map_err(|error| RsomicsError::InvalidInput(error.to_string()))?;
-        writer.write_all(b"\n").map_err(RsomicsError::Io)
-    })?;
+    body(stage.path())?;
     File::open(stage.path())
         .and_then(|directory| directory.sync_all())
         .rs_with_context(|| format!("syncing staged reports for {}", output.display()))?;
@@ -68,6 +81,71 @@ pub fn write_call_reports(output: &Path, result: &CallResult) -> Result<()> {
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .rs_with_context(|| format!("syncing report parent {}", parent.display()))?;
+    Ok(())
+}
+
+fn write_json<T: Serialize>(path: PathBuf, schema: &'static str, result: &T) -> Result<()> {
+    write_file(path, |writer| {
+        let document = ResultDocument {
+            schema,
+            producer: Producer {
+                name: "rsomics-cnv",
+                version: env!("CARGO_PKG_VERSION"),
+            },
+            result,
+        };
+        serde_json::to_writer_pretty(&mut *writer, &document)
+            .map_err(|error| RsomicsError::InvalidInput(error.to_string()))?;
+        writer.write_all(b"\n").map_err(RsomicsError::Io)
+    })
+}
+
+fn write_polysomy_compatibility(writer: &mut dyn Write, result: &PolysomyResult) -> Result<()> {
+    writeln!(
+        writer,
+        "# This file was produced by: rsomics-cnv {}",
+        env!("CARGO_PKG_VERSION")
+    )
+    .map_err(RsomicsError::Io)?;
+    writer.write_all(b"#\n# DIST\t[2]Chrom\t[3]BAF\t[4]Normalized Count\n# FIT\t[2]Chrom\t[3]Goodness of Fit\t[4]iFrom\t[5]iTo\t[6]The Fitted Function\n# CN\t[2]Chrom\t[3]Estimated Copy Number\t[4]Absolute fit deviation\n").map_err(RsomicsError::Io)?;
+    for chromosome in &result.chromosomes {
+        for bin in &chromosome.distribution.bins {
+            writeln!(
+                writer,
+                "DIST\t{}\t{:.6}\t{:.6}",
+                chromosome.distribution.reference_name, bin.baf, bin.normalized_count
+            )
+            .map_err(RsomicsError::Io)?;
+        }
+        if let Some(candidate) = chromosome
+            .candidates
+            .iter()
+            .find(|candidate| candidate.selected)
+        {
+            for curve in &candidate.curves {
+                writeln!(
+                    writer,
+                    "FIT\t{}\t{}\t{}\t{}\t{}",
+                    chromosome.distribution.reference_name,
+                    scientific(curve.absolute_deviation),
+                    curve.start_bin,
+                    curve.end_bin,
+                    curve.function
+                )
+                .map_err(RsomicsError::Io)?;
+            }
+        }
+        write!(
+            writer,
+            "CN\t{}\t{:.2}",
+            chromosome.distribution.reference_name, chromosome.copy_number
+        )
+        .map_err(RsomicsError::Io)?;
+        if let Some(deviation) = chromosome.absolute_deviation {
+            write!(writer, "\t{deviation:.6}").map_err(RsomicsError::Io)?;
+        }
+        writeln!(writer).map_err(RsomicsError::Io)?;
+    }
     Ok(())
 }
 
@@ -248,13 +326,141 @@ fn write_file(path: PathBuf, body: impl FnOnce(&mut dyn Write) -> Result<()>) ->
         .rs_with_context(|| format!("syncing staged report {}", path.display()))
 }
 
-fn validate_result(result: &CallResult) -> Result<()> {
+fn validate_call_result(result: &CallResult) -> Result<()> {
     validate_sample_name(&result.sample)?;
     if let Some(control) = result.control_sample.as_deref() {
         validate_sample_name(control)?;
         if control == result.sample {
             return Err(inconsistent("query and control sample names are equal"));
         }
+    }
+    Ok(())
+}
+
+fn validate_polysomy_result(result: &PolysomyResult) -> Result<()> {
+    if result.sample.is_empty() {
+        return Err(inconsistent_polysomy("sample name is empty"));
+    }
+    if result.chromosomes.is_empty() {
+        return Err(inconsistent_polysomy("result has no chromosomes"));
+    }
+    let mut references = HashSet::new();
+    for chromosome in &result.chromosomes {
+        let distribution = &chromosome.distribution;
+        if distribution.reference_name.is_empty()
+            || !references.insert(distribution.reference_name.as_str())
+        {
+            return Err(inconsistent_polysomy(
+                "reference names are empty or duplicated",
+            ));
+        }
+        if distribution.observations == 0 || distribution.bins.len() != BINS {
+            return Err(inconsistent_polysomy(format!(
+                "{} has an invalid observation or bin count",
+                distribution.reference_name
+            )));
+        }
+        if !(distribution.rr_boundary < distribution.heterozygous_center
+            && distribution.heterozygous_center < distribution.aa_boundary
+            && distribution.aa_boundary <= distribution.fitted_end
+            && distribution.fitted_end < BINS)
+        {
+            return Err(inconsistent_polysomy(format!(
+                "{} has invalid distribution boundaries",
+                distribution.reference_name
+            )));
+        }
+        for (index, bin) in distribution.bins.iter().enumerate() {
+            let expected = index as f64 / (BINS - 1) as f64;
+            if !bin.baf.is_finite()
+                || (bin.baf - expected).abs() > 1e-12
+                || !bin.normalized_count.is_finite()
+                || bin.normalized_count < 0.0
+            {
+                return Err(inconsistent_polysomy(format!(
+                    "{} has an invalid distribution bin",
+                    distribution.reference_name
+                )));
+            }
+        }
+        if !chromosome.copy_number.is_finite() {
+            return Err(inconsistent_polysomy(format!(
+                "{} copy number is not finite",
+                distribution.reference_name
+            )));
+        }
+        validate_deviation(chromosome.absolute_deviation, &distribution.reference_name)?;
+        let mut selected = None;
+        for (index, candidate) in chromosome.candidates.iter().enumerate() {
+            if !(2..=4).contains(&candidate.model_copy_number)
+                || !candidate.estimated_copy_number.is_finite()
+            {
+                return Err(inconsistent_polysomy(format!(
+                    "{} has an invalid candidate model",
+                    distribution.reference_name
+                )));
+            }
+            validate_deviation(candidate.absolute_deviation, &distribution.reference_name)?;
+            for curve in &candidate.curves {
+                if curve.start_bin > curve.end_bin
+                    || curve.end_bin >= BINS
+                    || !curve.absolute_deviation.is_finite()
+                    || curve.absolute_deviation < 0.0
+                    || curve.function.is_empty()
+                {
+                    return Err(inconsistent_polysomy(format!(
+                        "{} has an invalid fit curve",
+                        distribution.reference_name
+                    )));
+                }
+            }
+            if candidate.selected {
+                if candidate.rejection.is_some() || selected.replace(index).is_some() {
+                    return Err(inconsistent_polysomy(format!(
+                        "{} has inconsistent selected candidates",
+                        distribution.reference_name
+                    )));
+                }
+            } else if candidate.rejection.is_none() {
+                return Err(inconsistent_polysomy(format!(
+                    "{} has an unselected candidate without a rejection",
+                    distribution.reference_name
+                )));
+            }
+        }
+        match selected {
+            Some(index)
+                if chromosome.copy_number == chromosome.candidates[index].estimated_copy_number
+                    && chromosome.absolute_deviation
+                        == chromosome.candidates[index].absolute_deviation => {}
+            Some(_) => {
+                return Err(inconsistent_polysomy(format!(
+                    "{} selected candidate differs from the final call",
+                    distribution.reference_name
+                )));
+            }
+            None if chromosome.candidates.is_empty()
+                && distribution
+                    .preliminary_copy_number
+                    .is_some_and(|value| f64::from(value) == chromosome.copy_number)
+                && chromosome.absolute_deviation.is_none() => {}
+            None if !chromosome.candidates.is_empty() && chromosome.copy_number == -1.0 => {}
+            None => {
+                return Err(inconsistent_polysomy(format!(
+                    "{} has no decision supporting the final call",
+                    distribution.reference_name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_deviation(value: Option<f64>, reference_name: &str) -> Result<()> {
+    if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+        return Err(inconsistent_polysomy(format!(
+            "{reference_name} has an invalid absolute deviation"
+        )));
     }
     Ok(())
 }
@@ -270,4 +476,15 @@ fn validate_sample_name(name: &str) -> Result<()> {
 
 fn inconsistent(message: impl Into<String>) -> RsomicsError {
     RsomicsError::InvalidInput(format!("inconsistent call result: {}", message.into()))
+}
+
+fn inconsistent_polysomy(message: impl Into<String>) -> RsomicsError {
+    RsomicsError::InvalidInput(format!("inconsistent polysomy result: {}", message.into()))
+}
+
+fn scientific(value: f64) -> String {
+    let raw = format!("{value:.6e}");
+    let (mantissa, exponent) = raw.split_once('e').unwrap();
+    let exponent = exponent.parse::<i32>().unwrap();
+    format!("{mantissa}e{exponent:+03}")
 }

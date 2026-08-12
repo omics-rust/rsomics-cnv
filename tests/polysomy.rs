@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 use rsomics_cnv::polysomy::{PolysomyOptions, analyze, analyze_distributions};
+use rsomics_cnv::reports::write_polysomy_reports;
 
 fn write_fixture(path: &Path) {
     let mut text = String::from(
@@ -187,6 +188,16 @@ fn normalized_distributions_match_bcftools_1_24() {
     assert_eq!(actual, expected);
 
     let ours = analyze(&input, Some("SAMPLE".to_owned()), options).unwrap();
+    let ours_output = directory.path().join("rsomics");
+    write_polysomy_reports(&ours_output, &ours).unwrap();
+    let ours_report = std::fs::read_to_string(ours_output.join("dist.dat")).unwrap();
+    assert_eq!(
+        ours_report
+            .lines()
+            .filter(|line| line.starts_with("DIST\t"))
+            .collect::<Vec<_>>(),
+        expected.iter().map(String::as_str).collect::<Vec<_>>()
+    );
     let upstream_calls = std::fs::read_to_string(output.join("dist.dat"))
         .unwrap()
         .lines()
@@ -231,6 +242,24 @@ fn normalized_distributions_match_bcftools_1_24() {
             deviation
         );
     }
+    let upstream_report = std::fs::read_to_string(output.join("dist.dat")).unwrap();
+    let upstream_fit = upstream_report
+        .lines()
+        .find(|line| line.starts_with("FIT\tchr3\t"))
+        .unwrap()
+        .split('\t')
+        .collect::<Vec<_>>();
+    let ours_fit = ours_report
+        .lines()
+        .find(|line| line.starts_with("FIT\tchr3\t"))
+        .unwrap()
+        .split('\t')
+        .collect::<Vec<_>>();
+    assert_eq!(&ours_fit[3..5], &upstream_fit[3..5]);
+    assert!(
+        (ours_fit[2].parse::<f64>().unwrap() - upstream_fit[2].parse::<f64>().unwrap()).abs()
+            <= 0.2
+    );
 }
 
 #[test]
