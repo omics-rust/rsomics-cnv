@@ -55,10 +55,12 @@ pub struct Measurement {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SignalSite {
+    pub(crate) reference: usize,
     pub reference_name: String,
     pub position: u32,
     pub query: Measurement,
     pub control: Option<Measurement>,
+    pub(crate) alleles: Option<Vec<String>>,
 }
 
 pub struct SignalReader {
@@ -130,7 +132,19 @@ impl SignalReader {
         self.control_name.as_deref()
     }
 
+    pub(crate) fn reference_names(&self) -> Vec<String> {
+        self.header.contigs().keys().cloned().collect()
+    }
+
     pub fn next_site(&mut self) -> Result<Option<SignalSite>> {
+        self.next_site_inner(false)
+    }
+
+    pub(crate) fn next_site_with_alleles(&mut self) -> Result<Option<SignalSite>> {
+        self.next_site_inner(true)
+    }
+
+    fn next_site_inner(&mut self, include_alleles: bool) -> Result<Option<SignalSite>> {
         loop {
             let number = self.records + 1;
             let Some(record) = self
@@ -192,10 +206,16 @@ impl SignalReader {
             }
 
             return Ok(Some(SignalSite {
+                reference,
                 reference_name,
                 position,
                 query,
                 control,
+                alleles: include_alleles.then(|| {
+                    std::iter::once(record.reference_bases().to_owned())
+                        .chain(record.alternate_bases().as_ref().iter().cloned())
+                        .collect()
+                }),
             }));
         }
     }

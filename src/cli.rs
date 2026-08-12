@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
 use rsomics_common::{OutputArgs, Result, RsomicsError, ToolMeta, run as run_tool};
 use serde::Serialize;
 
-use crate::call::{CallOptions, analyze as analyze_calls};
+use crate::call::{CallOptions, analyze as analyze_calls, analyze_with_allele_frequencies};
 use crate::emission::{EvidenceParameters, SampleParameters};
 use crate::polysomy::{PolysomyOptions, analyze as analyze_polysomy};
 use crate::reports::{write_call_reports, write_polysomy_reports};
@@ -57,6 +57,10 @@ struct CallArgs {
     /// Matched control sample name
     #[arg(short, long, value_name = "NAME")]
     control: Option<String>,
+
+    /// Tab-separated CHROM, POS, REF,ALT, AF file; restricts analysis to listed sites
+    #[arg(short = 'f', long = "allele-frequencies", value_name = "TSV")]
+    allele_frequencies: Option<PathBuf>,
 
     /// BAF Gaussian standard deviation
     #[arg(long, default_value_t = 0.04)]
@@ -159,28 +163,30 @@ fn execute(command: Command) -> Result<RunSummary> {
     match command {
         Command::Call(args) => {
             require_new_output(&args.output)?;
-            let result = analyze_calls(
-                &args.input,
-                SampleSelection {
-                    query: args.sample,
-                    control: args.control,
+            let selection = SampleSelection {
+                query: args.sample,
+                control: args.control,
+            };
+            let options = CallOptions {
+                sample: SampleParameters {
+                    baf_deviation: args.baf_deviation,
+                    lrr_deviation: args.lrr_deviation,
+                    aberrant_fraction: args.aberrant_fraction,
                 },
-                CallOptions {
-                    sample: SampleParameters {
-                        baf_deviation: args.baf_deviation,
-                        lrr_deviation: args.lrr_deviation,
-                        aberrant_fraction: args.aberrant_fraction,
-                    },
-                    evidence: EvidenceParameters {
-                        baf_weight: args.baf_weight,
-                        lrr_weight: args.lrr_weight,
-                        error_probability: args.error_probability,
-                    },
-                    transition_probability: args.transition_probability,
-                    same_state_probability: args.same_state_probability,
-                    lrr_smoothing_window: args.lrr_smoothing_window,
+                evidence: EvidenceParameters {
+                    baf_weight: args.baf_weight,
+                    lrr_weight: args.lrr_weight,
+                    error_probability: args.error_probability,
                 },
-            )?;
+                transition_probability: args.transition_probability,
+                same_state_probability: args.same_state_probability,
+                lrr_smoothing_window: args.lrr_smoothing_window,
+            };
+            let result = if let Some(frequencies) = args.allele_frequencies {
+                analyze_with_allele_frequencies(&args.input, selection, options, &frequencies)?
+            } else {
+                analyze_calls(&args.input, selection, options)?
+            };
             write_call_reports(&args.output, &result)?;
             Ok(RunSummary {
                 workflow: "call",

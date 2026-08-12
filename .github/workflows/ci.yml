@@ -73,7 +73,9 @@ jobs:
           cd "$RUNNER_TEMP/bcftools-1.24"
           ./configure --without-curses --enable-libgsl
           make -j2
+          make -C htslib-1.24 bgzip tabix
           echo "$RUNNER_TEMP/bcftools-1.24" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/bcftools-1.24/htslib-1.24" >> "$GITHUB_PATH"
 
       - name: Test compatibility oracle
         if: matrix.target == 'linux-x86_64'

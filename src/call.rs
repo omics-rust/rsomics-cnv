@@ -3,6 +3,7 @@ use std::path::Path;
 use rsomics_common::{Result, RsomicsError};
 use serde::Serialize;
 
+use crate::allele_frequency::AlleleFrequencyReader;
 use crate::emission::{AlleleFrequencies, EmissionModel, EvidenceParameters, SampleParameters};
 use crate::hmm::{Hmm, phred_error_probability};
 use crate::signals::{Measurement, RequiredSignals, SampleSelection, SignalReader};
@@ -80,6 +81,7 @@ struct ChromosomeBuffer {
     positions: Vec<u32>,
     query: Vec<Measurement>,
     control: Vec<Measurement>,
+    frequencies: Vec<AlleleFrequencies>,
 }
 
 pub fn analyze(
@@ -87,37 +89,59 @@ pub fn analyze(
     selection: SampleSelection,
     options: CallOptions,
 ) -> Result<CallResult> {
-    if options.lrr_smoothing_window == 0 {
-        return Err(invalid("LRR smoothing window must be positive"));
-    }
-    let engine = CallEngine {
-        model: EmissionModel::new(options.sample, options.evidence)?,
-        single_hmm: Hmm::single_sample(options.transition_probability)?,
-        paired_hmm: selection
-            .control
-            .as_ref()
-            .map(|_| {
-                Hmm::paired_samples(
-                    options.transition_probability,
-                    options.same_state_probability,
-                )
-            })
-            .transpose()?,
-        smoothing_window: options.lrr_smoothing_window,
-    };
-    let required = if options.evidence.lrr_weight == 0.0 {
+    let engine = CallEngine::new(options, selection.control.is_some())?;
+    analyze_inner(input, selection, engine, None)
+}
+
+pub fn analyze_with_allele_frequencies(
+    input: &Path,
+    selection: SampleSelection,
+    options: CallOptions,
+    allele_frequencies: &Path,
+) -> Result<CallResult> {
+    let engine = CallEngine::new(options, selection.control.is_some())?;
+    analyze_inner(input, selection, engine, Some(allele_frequencies))
+}
+
+fn analyze_inner(
+    input: &Path,
+    selection: SampleSelection,
+    engine: CallEngine,
+    allele_frequency_path: Option<&Path>,
+) -> Result<CallResult> {
+    let required = if engine.model.lrr_weight() == 0.0 {
         RequiredSignals::Baf
     } else {
         RequiredSignals::BafAndLrr
     };
     let mut reader = SignalReader::open(input, selection, required)?;
+    let mut allele_frequencies = allele_frequency_path
+        .map(|path| AlleleFrequencyReader::open(path, &reader.reference_names()))
+        .transpose()?;
     let sample = reader.query_sample().to_owned();
     let control_sample = reader.control_sample().map(str::to_owned);
     let mut chromosomes = Vec::new();
     let mut current_name = None;
     let mut buffer = ChromosomeBuffer::default();
 
-    while let Some(site) = reader.next_site()? {
+    while let Some(site) = (if allele_frequencies.is_some() {
+        reader.next_site_with_alleles()
+    } else {
+        reader.next_site()
+    })? {
+        let frequencies = if let Some(reader) = &mut allele_frequencies {
+            let Some(frequencies) = reader.frequencies(
+                site.reference,
+                site.position,
+                site.alleles.as_deref().unwrap(),
+            )?
+            else {
+                continue;
+            };
+            frequencies
+        } else {
+            AlleleFrequencies::default()
+        };
         if current_name
             .as_deref()
             .is_some_and(|name| name != site.reference_name)
@@ -131,12 +155,16 @@ pub fn analyze(
         current_name.get_or_insert(site.reference_name);
         buffer.positions.push(site.position);
         buffer.query.push(site.query);
+        buffer.frequencies.push(frequencies);
         if let Some(measurement) = site.control {
             buffer.control.push(measurement);
         }
     }
     if let Some(reference_name) = current_name {
         chromosomes.push(call_chromosome(reference_name, &mut buffer, &engine)?);
+    }
+    if let Some(reader) = allele_frequencies {
+        reader.finish()?;
     }
     if chromosomes.is_empty() {
         return Err(invalid(
@@ -149,6 +177,27 @@ pub fn analyze(
         control_sample,
         chromosomes,
     })
+}
+
+impl CallEngine {
+    fn new(options: CallOptions, paired: bool) -> Result<Self> {
+        if options.lrr_smoothing_window == 0 {
+            return Err(invalid("LRR smoothing window must be positive"));
+        }
+        Ok(Self {
+            model: EmissionModel::new(options.sample, options.evidence)?,
+            single_hmm: Hmm::single_sample(options.transition_probability)?,
+            paired_hmm: paired
+                .then(|| {
+                    Hmm::paired_samples(
+                        options.transition_probability,
+                        options.same_state_probability,
+                    )
+                })
+                .transpose()?,
+            smoothing_window: options.lrr_smoothing_window,
+        })
+    }
 }
 
 fn call_chromosome(
@@ -171,11 +220,11 @@ fn call_chromosome(
         .iter()
         .copied()
         .zip(query_lrr.iter().copied())
-        .map(|(measurement, lrr)| {
-            engine.model.probabilities(
-                Measurement { lrr, ..measurement },
-                AlleleFrequencies::default(),
-            )
+        .zip(buffer.frequencies.iter().copied())
+        .map(|((measurement, lrr), frequencies)| {
+            engine
+                .model
+                .probabilities(Measurement { lrr, ..measurement }, frequencies)
         })
         .collect::<Result<Vec<_>>>()?;
     let (path, posterior) = if let Some(hmm) = &engine.paired_hmm {
@@ -184,11 +233,11 @@ fn call_chromosome(
             .iter()
             .copied()
             .zip(control_lrr.as_ref().unwrap().iter().copied())
-            .map(|(measurement, lrr)| {
-                engine.model.probabilities(
-                    Measurement { lrr, ..measurement },
-                    AlleleFrequencies::default(),
-                )
+            .zip(buffer.frequencies.iter().copied())
+            .map(|((measurement, lrr), frequencies)| {
+                engine
+                    .model
+                    .probabilities(Measurement { lrr, ..measurement }, frequencies)
             })
             .collect::<Result<Vec<_>>>()?;
         let emissions = query_emissions
@@ -279,6 +328,7 @@ fn call_chromosome(
     buffer.positions.clear();
     buffer.query.clear();
     buffer.control.clear();
+    buffer.frequencies.clear();
     Ok(ChromosomeCall {
         reference_name,
         sites,

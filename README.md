@@ -13,11 +13,12 @@ They fail on malformed signals, unsorted records, ambiguous sample selection,
 invalid model parameters, and an existing output directory. Report bundles are
 committed as a complete directory and include a versioned JSON result alongside
 the compatibility tables. `--json` emits the shared rsomics command envelope to
-standard output.
+standard output. `call --allele-frequencies` accepts plain or gzip-compressed
+`CHROM`, `POS`, `REF,ALT`, `AF` tables and restricts inference to listed sites.
 
-The crate remains unpublished while region and target selection, external
-allele-frequency input, plotting, and representative performance measurements
-are completed. Unimplemented operations are not exposed by the CLI.
+The crate remains unpublished while region and target selection, plotting, and
+representative performance measurements are completed. Unimplemented
+operations are not exposed by the CLI.
 
 The compatibility reference is bcftools 1.24 `cnv`, `polysomy`, `HMM.c`, and
 `peakfit.c`, retained under the upstream MIT license. Historical rsomics

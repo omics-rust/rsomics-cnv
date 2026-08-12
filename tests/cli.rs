@@ -65,6 +65,7 @@ fn help_exposes_one_product_tree() {
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("--sample <NAME>"), "{help}");
     assert!(help.contains("--control <NAME>"), "{help}");
+    assert!(help.contains("--allele-frequencies <TSV>"), "{help}");
     assert!(help.contains("--output <DIRECTORY>"), "{help}");
 }
 
@@ -72,10 +73,24 @@ fn help_exposes_one_product_tree() {
 fn call_writes_reports_and_shared_json_envelope() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("call.vcf");
+    let frequencies = directory.path().join("frequencies.tsv");
     let reports = directory.path().join("call-reports");
     write_call_fixture(&input);
+    std::fs::write(
+        &frequencies,
+        "chr1\t1000\tA,G\t0.1\nchr1\t6000\tA,G\t0.2\nchr1\t11000\tA,G\t0.3\n",
+    )
+    .unwrap();
     let output = binary()
-        .args(["--json", "call", "--sample", "SAMPLE", "--output"])
+        .args([
+            "--json",
+            "call",
+            "--sample",
+            "SAMPLE",
+            "--allele-frequencies",
+        ])
+        .arg(&frequencies)
+        .arg("--output")
         .arg(&reports)
         .arg(&input)
         .output()
@@ -90,6 +105,7 @@ fn call_writes_reports_and_shared_json_envelope() {
     assert_eq!(document["tool"], "rsomics-cnv");
     assert_eq!(document["result"]["workflow"], "call");
     assert_eq!(document["result"]["sample"], "SAMPLE");
+    assert_eq!(document["result"]["sites"], 3);
     assert!(reports.join("result.json").is_file());
     assert!(reports.join("summary.SAMPLE.tab").is_file());
 }

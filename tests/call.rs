@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use rsomics_cnv::call::{CallOptions, analyze};
+use rsomics_cnv::call::{CallOptions, analyze, analyze_with_allele_frequencies};
 use rsomics_cnv::reports::write_call_reports;
 use rsomics_cnv::signals::SampleSelection;
 
@@ -98,6 +98,55 @@ fn invalid_call_parameters_fail_before_reading() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("smoothing window"), "{error}");
+    let error = analyze_with_allele_frequencies(
+        Path::new("missing.vcf"),
+        SampleSelection::default(),
+        CallOptions {
+            lrr_smoothing_window: 0,
+            ..CallOptions::default()
+        },
+        Path::new("missing.tsv"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("smoothing window"), "{error}");
+}
+
+#[test]
+fn allele_frequency_file_restricts_sites_and_checks_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("cnv.vcf");
+    let frequencies = directory.path().join("frequencies.tsv");
+    write_fixture(&input);
+    std::fs::write(
+        &frequencies,
+        "#CHROM\tPOS\tREF,ALT\tAF\n\
+chr1\t1000\tA,G\t0.10\n\
+chr1\t6000\tA,T\t0.25\n\
+chr1\t11000\tA,G\t.\n",
+    )
+    .unwrap();
+    let result = analyze_with_allele_frequencies(
+        &input,
+        SampleSelection::default(),
+        CallOptions::default(),
+        &frequencies,
+    )
+    .unwrap();
+    assert_eq!(result.chromosomes[0].sites.len(), 3);
+
+    std::fs::write(
+        &frequencies,
+        "chr1\t6000\tA,G\t0.10\nchr1\t1000\tA,G\t0.20\n",
+    )
+    .unwrap();
+    let error = analyze_with_allele_frequencies(
+        &input,
+        SampleSelection::default(),
+        CallOptions::default(),
+        &frequencies,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("coordinate sorted"), "{error}");
 }
 
 #[test]
@@ -316,4 +365,79 @@ fn paired_marginals_match_bcftools_1_24() {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "release oracle: requires bcftools 1.24"]
+fn allele_frequency_restriction_matches_bcftools_1_24() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("cnv.vcf");
+    let frequencies = directory.path().join("frequencies.tsv");
+    let output = directory.path().join("bcftools");
+    write_fixture(&input);
+    let mut table = String::new();
+    for index in (0..180).step_by(3) {
+        let position = index * 5_000 + 1_000;
+        let (alleles, frequency) = match index % 9 {
+            0 => ("A,G", "0.25"),
+            3 => ("A,T", "0.40"),
+            _ => ("A,G", "."),
+        };
+        table.push_str(&format!("chr1\t{position}\t{alleles}\t{frequency}\n"));
+    }
+    std::fs::write(&frequencies, table).unwrap();
+    let compression = Command::new("bgzip")
+        .args(["--force"])
+        .arg(&frequencies)
+        .output()
+        .unwrap();
+    assert!(
+        compression.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compression.stderr)
+    );
+    let frequencies = directory.path().join("frequencies.tsv.gz");
+    let indexing = Command::new("tabix")
+        .args(["--sequence", "1", "--begin", "2", "--end", "2"])
+        .arg(&frequencies)
+        .output()
+        .unwrap();
+    assert!(
+        indexing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexing.stderr)
+    );
+    let upstream = Command::new("bcftools")
+        .args(["cnv", "-s", "SAMPLE", "-f"])
+        .arg(&frequencies)
+        .arg("-o")
+        .arg(&output)
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        upstream.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upstream.stderr)
+    );
+    let ours = analyze_with_allele_frequencies(
+        &input,
+        SampleSelection {
+            query: Some("SAMPLE".to_owned()),
+            control: None,
+        },
+        CallOptions::default(),
+        &frequencies,
+    )
+    .unwrap();
+    let ours_output = directory.path().join("rsomics");
+    write_call_reports(&ours_output, &ours).unwrap();
+    assert_eq!(
+        std::fs::read(output.join("dat.SAMPLE.tab")).unwrap(),
+        std::fs::read(ours_output.join("dat.SAMPLE.tab")).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(output.join("cn.SAMPLE.tab")).unwrap(),
+        std::fs::read(ours_output.join("cn.SAMPLE.tab")).unwrap()
+    );
 }

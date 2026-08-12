@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod allele_frequency;
 pub mod call;
 mod cli;
 pub mod emission;
