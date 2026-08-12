@@ -85,3 +85,4 @@ jobs:
           grep -q "Detect number of chromosomal copies" "$RUNNER_TEMP/polysomy-help"
           cargo test --locked --test call -- --ignored
           cargo test --locked --test polysomy -- --ignored
+          cargo test --locked --test selection -- --ignored

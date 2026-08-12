@@ -8,6 +8,7 @@ mod fitting;
 pub mod hmm;
 pub mod polysomy;
 pub mod reports;
+pub mod selection;
 pub mod signals;
 
 #[must_use]

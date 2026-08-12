@@ -582,6 +582,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "noodles-util"
+version = "0.82.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "567c9ce0176a2c82097de4ea27c4da7395de0447f8df0369d6dfd99c9afdc788"
+dependencies = [
+ "bstr",
+ "flate2",
+ "noodles-bcf",
+ "noodles-bgzf",
+ "noodles-core",
+ "noodles-csi",
+ "noodles-vcf",
+]
+
+[[package]]
 name = "noodles-vcf"
 version = "0.90.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -739,9 +754,13 @@ dependencies = [
  "nalgebra",
  "noodles-bcf",
  "noodles-bgzf",
+ "noodles-core",
+ "noodles-tabix",
+ "noodles-util",
  "noodles-vcf",
  "rsomics-common",
  "rsomics-help",
+ "rsomics-intervals",
  "serde",
  "serde_json",
  "tempfile",
@@ -768,6 +787,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5922ec5a261660869fc36aa05f731c0adb059c43344eb78c2393f05611797fe1"
 dependencies = [
  "clap",
+]
+
+[[package]]
+name = "rsomics-intervals"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d55e00dc3e6c0423430ed2ac84dfb21fe05acf522e83db1b75b09c995fa5b593"
+dependencies = [
+ "flate2",
+ "thiserror",
 ]
 
 [[package]]

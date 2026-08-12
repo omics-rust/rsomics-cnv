@@ -6,7 +6,8 @@ use serde::Serialize;
 use crate::allele_frequency::AlleleFrequencyReader;
 use crate::emission::{AlleleFrequencies, EmissionModel, EvidenceParameters, SampleParameters};
 use crate::hmm::{Hmm, phred_error_probability};
-use crate::signals::{Measurement, RequiredSignals, SampleSelection, SignalReader};
+use crate::selection::{CompiledSelection, SiteSelection};
+use crate::signals::{Measurement, RequiredSignals, SampleSelection, SelectedSignalReader};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CallOptions {
@@ -90,7 +91,18 @@ pub fn analyze(
     options: CallOptions,
 ) -> Result<CallResult> {
     let engine = CallEngine::new(options, selection.control.is_some())?;
-    analyze_inner(input, selection, engine, None)
+    analyze_inner(input, selection, engine, None, &SiteSelection::default())
+}
+
+/// Runs copy-number inference after applying indexed regions or streaming targets.
+pub fn analyze_selected(
+    input: &Path,
+    selection: SampleSelection,
+    options: CallOptions,
+    sites: &SiteSelection,
+) -> Result<CallResult> {
+    let engine = CallEngine::new(options, selection.control.is_some())?;
+    analyze_inner(input, selection, engine, None, sites)
 }
 
 pub fn analyze_with_allele_frequencies(
@@ -100,7 +112,25 @@ pub fn analyze_with_allele_frequencies(
     allele_frequencies: &Path,
 ) -> Result<CallResult> {
     let engine = CallEngine::new(options, selection.control.is_some())?;
-    analyze_inner(input, selection, engine, Some(allele_frequencies))
+    analyze_inner(
+        input,
+        selection,
+        engine,
+        Some(allele_frequencies),
+        &SiteSelection::default(),
+    )
+}
+
+/// Runs selected-site inference restricted by an external allele-frequency table.
+pub fn analyze_with_allele_frequencies_selected(
+    input: &Path,
+    selection: SampleSelection,
+    options: CallOptions,
+    allele_frequencies: &Path,
+    sites: &SiteSelection,
+) -> Result<CallResult> {
+    let engine = CallEngine::new(options, selection.control.is_some())?;
+    analyze_inner(input, selection, engine, Some(allele_frequencies), sites)
 }
 
 fn analyze_inner(
@@ -108,13 +138,15 @@ fn analyze_inner(
     selection: SampleSelection,
     engine: CallEngine,
     allele_frequency_path: Option<&Path>,
+    site_selection: &SiteSelection,
 ) -> Result<CallResult> {
     let required = if engine.model.lrr_weight() == 0.0 {
         RequiredSignals::Baf
     } else {
         RequiredSignals::BafAndLrr
     };
-    let mut reader = SignalReader::open(input, selection, required)?;
+    let site_selection = CompiledSelection::new(site_selection)?;
+    let mut reader = SelectedSignalReader::open(input, selection, required, site_selection)?;
     let mut allele_frequencies = allele_frequency_path
         .map(|path| AlleleFrequencyReader::open(path, &reader.reference_names()))
         .transpose()?;
@@ -124,11 +156,7 @@ fn analyze_inner(
     let mut current_name = None;
     let mut buffer = ChromosomeBuffer::default();
 
-    while let Some(site) = (if allele_frequencies.is_some() {
-        reader.next_site_with_alleles()
-    } else {
-        reader.next_site()
-    })? {
+    reader.visit(allele_frequencies.is_some(), |site| {
         let frequencies = if let Some(reader) = &mut allele_frequencies {
             let Some(frequencies) = reader.frequencies(
                 site.reference,
@@ -136,7 +164,7 @@ fn analyze_inner(
                 site.alleles.as_deref().unwrap(),
             )?
             else {
-                continue;
+                return Ok(());
             };
             frequencies
         } else {
@@ -159,7 +187,8 @@ fn analyze_inner(
         if let Some(measurement) = site.control {
             buffer.control.push(measurement);
         }
-    }
+        Ok(())
+    })?;
     if let Some(reference_name) = current_name {
         chromosomes.push(call_chromosome(reference_name, &mut buffer, &engine)?);
     }

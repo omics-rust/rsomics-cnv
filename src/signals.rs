@@ -1,10 +1,12 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use flate2::bufread::MultiGzDecoder;
 use noodles_bcf as bcf;
+use noodles_bgzf as bgzf;
+use noodles_util::variant::io::indexed_reader;
 use noodles_vcf::{
     self as vcf,
     header::record::value::map::format,
@@ -12,6 +14,8 @@ use noodles_vcf::{
 };
 use rsomics_common::{Context, Result, RsomicsError};
 use serde::Serialize;
+
+use crate::selection::{CompiledSelection, overlaps};
 
 type Source = Box<dyn Read>;
 type Buffered = BufReader<Source>;
@@ -65,15 +69,37 @@ pub struct SignalSite {
 
 pub struct SignalReader {
     reader: VariantReader,
-    header: vcf::Header,
     scratch: RecordScratch,
+    decoder: SignalDecoder,
+    records: u64,
+}
+
+struct SignalDecoder {
+    header: vcf::Header,
     required: RequiredSignals,
     query: usize,
     control: Option<usize>,
     query_name: String,
     control_name: Option<String>,
     previous: Option<(usize, u32)>,
+}
+
+pub(crate) struct IndexedSignalReader {
+    reader: indexed_reader::IndexedReader<bgzf::io::Reader<File>>,
+    header: vcf::Header,
+    decoder: SignalDecoder,
+    regions: Vec<noodles_core::Region>,
+    selection: CompiledSelection,
+    input: PathBuf,
     records: u64,
+}
+
+pub(crate) enum SelectedSignalReader {
+    Streaming {
+        reader: Box<SignalReader>,
+        selection: CompiledSelection,
+    },
+    Indexed(Box<IndexedSignalReader>),
 }
 
 impl fmt::Debug for SignalReader {
@@ -81,9 +107,9 @@ impl fmt::Debug for SignalReader {
         formatter
             .debug_struct("SignalReader")
             .field("source", &self.reader.source)
-            .field("required", &self.required)
-            .field("query_name", &self.query_name)
-            .field("control_name", &self.control_name)
+            .field("required", &self.decoder.required)
+            .field("query_name", &self.decoder.query_name)
+            .field("control_name", &self.decoder.control_name)
             .field("records", &self.records)
             .finish()
     }
@@ -93,11 +119,73 @@ impl SignalReader {
     pub fn open(path: &Path, samples: SampleSelection, required: RequiredSignals) -> Result<Self> {
         let mut reader = VariantReader::open(path)?;
         let header = reader.read_header()?;
+        Ok(Self {
+            decoder: SignalDecoder::new(header, samples, required)?,
+            reader,
+            scratch: RecordScratch::default(),
+            records: 0,
+        })
+    }
+
+    pub fn query_sample(&self) -> &str {
+        &self.decoder.query_name
+    }
+
+    pub fn control_sample(&self) -> Option<&str> {
+        self.decoder.control_name.as_deref()
+    }
+
+    pub(crate) fn reference_names(&self) -> Vec<String> {
+        self.decoder.reference_names()
+    }
+
+    pub fn next_site(&mut self) -> Result<Option<SignalSite>> {
+        self.next_site_inner(false, None)
+    }
+
+    pub(crate) fn next_selected_site(
+        &mut self,
+        include_alleles: bool,
+        selection: &CompiledSelection,
+    ) -> Result<Option<SignalSite>> {
+        self.next_site_inner(include_alleles, Some(selection))
+    }
+
+    fn next_site_inner(
+        &mut self,
+        include_alleles: bool,
+        selection: Option<&CompiledSelection>,
+    ) -> Result<Option<SignalSite>> {
+        loop {
+            let number = self.records + 1;
+            let Some(record) =
+                self.reader
+                    .read_record(&self.decoder.header, &mut self.scratch, number)?
+            else {
+                return Ok(None);
+            };
+            self.records = number;
+            let keep = selection.is_none_or(|selection| selection.keeps(&record));
+            if let Some(site) =
+                self.decoder
+                    .decode(&record, &self.reader.source, number, include_alleles, keep)?
+            {
+                return Ok(Some(site));
+            }
+        }
+    }
+}
+
+impl SignalDecoder {
+    fn new(
+        header: vcf::Header,
+        samples: SampleSelection,
+        required: RequiredSignals,
+    ) -> Result<Self> {
         validate_format(&header, "BAF")?;
         if required == RequiredSignals::BafAndLrr {
             validate_format(&header, "LRR")?;
         }
-
         let (query, query_name) = select_query(&header, samples.query.as_deref())?;
         let (control, control_name) = match samples.control.as_deref() {
             Some(name) => {
@@ -109,118 +197,102 @@ impl SignalReader {
             }
             None => (None, None),
         };
-
         Ok(Self {
-            reader,
             header,
-            scratch: RecordScratch::default(),
             required,
             query,
             control,
             query_name,
             control_name,
             previous: None,
-            records: 0,
         })
     }
 
-    pub fn query_sample(&self) -> &str {
-        &self.query_name
-    }
-
-    pub fn control_sample(&self) -> Option<&str> {
-        self.control_name.as_deref()
-    }
-
-    pub(crate) fn reference_names(&self) -> Vec<String> {
+    fn reference_names(&self) -> Vec<String> {
         self.header.contigs().keys().cloned().collect()
     }
 
-    pub fn next_site(&mut self) -> Result<Option<SignalSite>> {
-        self.next_site_inner(false)
-    }
-
-    pub(crate) fn next_site_with_alleles(&mut self) -> Result<Option<SignalSite>> {
-        self.next_site_inner(true)
-    }
-
-    fn next_site_inner(&mut self, include_alleles: bool) -> Result<Option<SignalSite>> {
-        loop {
-            let number = self.records + 1;
-            let Some(record) = self
-                .reader
-                .read_record(&self.header, &mut self.scratch, number)?
-            else {
-                return Ok(None);
-            };
-            self.records = number;
-
-            let reference_name = record.reference_sequence_name().to_owned();
-            let reference = self
-                .header
-                .contigs()
-                .get_index_of(&reference_name)
-                .ok_or_else(|| {
-                    record_error(
-                        &self.reader.source,
-                        number,
-                        format!("reference {reference_name:?} is absent from the header"),
-                    )
-                })?;
-            let position = record
-                .variant_start()
-                .map(usize::from)
-                .and_then(|value| u32::try_from(value).ok())
-                .ok_or_else(|| {
-                    record_error(
-                        &self.reader.source,
-                        number,
-                        "record position is absent or exceeds uint32",
-                    )
-                })?;
-            self.check_order(reference, position, number)?;
-
-            let query = measurement(
-                &record,
-                self.query,
-                self.required,
-                &self.reader.source,
-                number,
-                &self.query_name,
-            )?;
-            let control = self
-                .control
-                .map(|index| {
-                    measurement(
-                        &record,
-                        index,
-                        self.required,
-                        &self.reader.source,
-                        number,
-                        self.control_name.as_deref().unwrap(),
-                    )
-                })
-                .transpose()?;
-            if query.baf.is_none() && control.is_none_or(|value| value.baf.is_none()) {
-                continue;
-            }
-
-            return Ok(Some(SignalSite {
-                reference,
-                reference_name,
-                position,
-                query,
-                control,
-                alleles: include_alleles.then(|| {
-                    std::iter::once(record.reference_bases().to_owned())
-                        .chain(record.alternate_bases().as_ref().iter().cloned())
-                        .collect()
-                }),
-            }));
+    fn decode(
+        &mut self,
+        record: &RecordBuf,
+        source: &str,
+        number: u64,
+        include_alleles: bool,
+        keep: bool,
+    ) -> Result<Option<SignalSite>> {
+        let reference_name = record.reference_sequence_name().to_owned();
+        let reference = self
+            .header
+            .contigs()
+            .get_index_of(&reference_name)
+            .ok_or_else(|| {
+                record_error(
+                    source,
+                    number,
+                    format!("reference {reference_name:?} is absent from the header"),
+                )
+            })?;
+        let position = record
+            .variant_start()
+            .map(usize::from)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                record_error(
+                    source,
+                    number,
+                    "record position is absent or exceeds uint32",
+                )
+            })?;
+        self.check_order(reference, position, number, source)?;
+        if !keep {
+            return Ok(None);
         }
+
+        let query = measurement(
+            record,
+            self.query,
+            self.required,
+            source,
+            number,
+            &self.query_name,
+        )?;
+        let control = self
+            .control
+            .map(|index| {
+                measurement(
+                    record,
+                    index,
+                    self.required,
+                    source,
+                    number,
+                    self.control_name.as_deref().expect("selected control"),
+                )
+            })
+            .transpose()?;
+        if query.baf.is_none() && control.is_none_or(|value| value.baf.is_none()) {
+            return Ok(None);
+        }
+        Ok(Some(SignalSite {
+            reference,
+            reference_name,
+            position,
+            query,
+            control,
+            alleles: include_alleles.then(|| {
+                std::iter::once(record.reference_bases().to_owned())
+                    .chain(record.alternate_bases().as_ref().iter().cloned())
+                    .collect()
+            }),
+        }))
     }
 
-    fn check_order(&mut self, reference: usize, position: u32, number: u64) -> Result<()> {
+    fn check_order(
+        &mut self,
+        reference: usize,
+        position: u32,
+        number: u64,
+        source: &str,
+    ) -> Result<()> {
         if self
             .previous
             .is_some_and(|(previous_reference, previous_position)| {
@@ -229,12 +301,143 @@ impl SignalReader {
             })
         {
             return Err(record_error(
-                &self.reader.source,
+                source,
                 number,
                 "records must be coordinate sorted in header contig order",
             ));
         }
         self.previous = Some((reference, position));
+        Ok(())
+    }
+}
+
+impl SelectedSignalReader {
+    pub(crate) fn open(
+        path: &Path,
+        samples: SampleSelection,
+        required: RequiredSignals,
+        selection: CompiledSelection,
+    ) -> Result<Self> {
+        if let Some(regions) = selection.regions() {
+            let mut reader = indexed_reader::Builder::default()
+                .build_from_path(path)
+                .rs_with_context(|| format!("opening indexed variant input {}", path.display()))?;
+            let header = reader
+                .read_header()
+                .rs_with_context(|| format!("reading variant header {}", path.display()))?;
+            let query_regions = regions.merged(&header)?;
+            let decoder = SignalDecoder::new(header.clone(), samples, required)?;
+            return Ok(Self::Indexed(Box::new(IndexedSignalReader {
+                reader,
+                header,
+                decoder,
+                regions: query_regions,
+                selection,
+                input: path.to_owned(),
+                records: 0,
+            })));
+        }
+        Ok(Self::Streaming {
+            reader: Box::new(SignalReader::open(path, samples, required)?),
+            selection,
+        })
+    }
+
+    pub(crate) fn query_sample(&self) -> &str {
+        match self {
+            Self::Streaming { reader, .. } => reader.query_sample(),
+            Self::Indexed(reader) => &reader.decoder.query_name,
+        }
+    }
+
+    pub(crate) fn control_sample(&self) -> Option<&str> {
+        match self {
+            Self::Streaming { reader, .. } => reader.control_sample(),
+            Self::Indexed(reader) => reader.decoder.control_name.as_deref(),
+        }
+    }
+
+    pub(crate) fn reference_names(&self) -> Vec<String> {
+        match self {
+            Self::Streaming { reader, .. } => reader.reference_names(),
+            Self::Indexed(reader) => reader.decoder.reference_names(),
+        }
+    }
+
+    pub(crate) fn visit(
+        &mut self,
+        include_alleles: bool,
+        mut visit: impl FnMut(SignalSite) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            Self::Streaming { reader, selection } => {
+                while let Some(site) = reader.next_selected_site(include_alleles, selection)? {
+                    visit(site)?;
+                }
+                Ok(())
+            }
+            Self::Indexed(reader) => reader.visit(include_alleles, visit),
+        }
+    }
+}
+
+impl IndexedSignalReader {
+    fn visit(
+        &mut self,
+        include_alleles: bool,
+        mut visit: impl FnMut(SignalSite) -> Result<()>,
+    ) -> Result<()> {
+        let Self {
+            reader,
+            header,
+            decoder,
+            regions,
+            selection,
+            input,
+            records,
+        } = self;
+        let source = input.display().to_string();
+        let overlap = selection
+            .regions()
+            .expect("indexed signal reader has regions")
+            .overlap();
+        for (region_index, region) in regions.iter().enumerate() {
+            let query = reader
+                .query(header, region)
+                .rs_with_context(|| format!("querying region {region}"))?;
+            for result in query {
+                *records += 1;
+                let number = *records;
+                let raw = result.rs_with_context(|| {
+                    format!(
+                        "reading indexed variant record {number} from {}",
+                        input.display()
+                    )
+                })?;
+                let record =
+                    RecordBuf::try_from_variant_record(header, raw.as_ref()).map_err(|error| {
+                        record_error(
+                            &source,
+                            number,
+                            format!("decoding indexed variant record: {error}"),
+                        )
+                    })?;
+                if !overlaps(&record, region.interval(), overlap)
+                    || regions[..region_index].iter().any(|previous| {
+                        previous.name() == region.name()
+                            && overlaps(&record, previous.interval(), overlap)
+                    })
+                {
+                    continue;
+                }
+                let keep = selection.keeps(&record);
+                if let Some(site) =
+                    decoder.decode(&record, &source, number, include_alleles, keep)?
+                {
+                    visit(site)?;
+                }
+            }
+        }
         Ok(())
     }
 }

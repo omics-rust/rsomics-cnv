@@ -66,7 +66,19 @@ fn help_exposes_one_product_tree() {
     assert!(help.contains("--sample <NAME>"), "{help}");
     assert!(help.contains("--control <NAME>"), "{help}");
     assert!(help.contains("--allele-frequencies <TSV>"), "{help}");
+    assert!(help.contains("--regions-file <FILE>"), "{help}");
+    assert!(help.contains("--targets-file <FILE>"), "{help}");
+    assert!(
+        help.contains("--regions-overlap <REGIONS_OVERLAP>"),
+        "{help}"
+    );
     assert!(help.contains("--output <DIRECTORY>"), "{help}");
+
+    let output = binary().args(["help", "polysomy"]).output().unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("--regions <REGIONS>"), "{help}");
+    assert!(help.contains("--targets <TARGETS>"), "{help}");
 }
 
 #[test]
@@ -74,6 +86,7 @@ fn call_writes_reports_and_shared_json_envelope() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("call.vcf");
     let frequencies = directory.path().join("frequencies.tsv");
+    let targets = directory.path().join("targets.txt");
     let reports = directory.path().join("call-reports");
     write_call_fixture(&input);
     std::fs::write(
@@ -81,6 +94,7 @@ fn call_writes_reports_and_shared_json_envelope() {
         "chr1\t1000\tA,G\t0.1\nchr1\t6000\tA,G\t0.2\nchr1\t11000\tA,G\t0.3\n",
     )
     .unwrap();
+    std::fs::write(&targets, "chr1\t6000\n").unwrap();
     let output = binary()
         .args([
             "--json",
@@ -90,6 +104,8 @@ fn call_writes_reports_and_shared_json_envelope() {
             "--allele-frequencies",
         ])
         .arg(&frequencies)
+        .arg("--targets-file")
+        .arg(&targets)
         .arg("--output")
         .arg(&reports)
         .arg(&input)
@@ -105,7 +121,7 @@ fn call_writes_reports_and_shared_json_envelope() {
     assert_eq!(document["tool"], "rsomics-cnv");
     assert_eq!(document["result"]["workflow"], "call");
     assert_eq!(document["result"]["sample"], "SAMPLE");
-    assert_eq!(document["result"]["sites"], 3);
+    assert_eq!(document["result"]["sites"], 1);
     assert!(reports.join("result.json").is_file());
     assert!(reports.join("summary.SAMPLE.tab").is_file());
 }

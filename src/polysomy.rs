@@ -4,7 +4,8 @@ use rsomics_common::{Result, RsomicsError};
 use serde::Serialize;
 
 use crate::fitting::{FitOutcome, Peak, fit};
-use crate::signals::{RequiredSignals, SampleSelection, SignalReader};
+use crate::selection::{CompiledSelection, SiteSelection};
+use crate::signals::{RequiredSignals, SampleSelection, SelectedSignalReader};
 
 pub const BINS: usize = 150;
 
@@ -126,7 +127,17 @@ pub fn analyze(
     sample: Option<String>,
     options: PolysomyOptions,
 ) -> Result<PolysomyResult> {
-    let distributions = analyze_distributions(input, sample, options)?;
+    analyze_selected(input, sample, options, &SiteSelection::default())
+}
+
+/// Fits chromosome copy-number models after applying regions or targets.
+pub fn analyze_selected(
+    input: &Path,
+    sample: Option<String>,
+    options: PolysomyOptions,
+    selection: &SiteSelection,
+) -> Result<PolysomyResult> {
+    let distributions = analyze_distributions_selected(input, sample, options, selection)?;
     let chromosomes = distributions
         .chromosomes
         .into_iter()
@@ -143,18 +154,30 @@ pub fn analyze_distributions(
     sample: Option<String>,
     options: PolysomyOptions,
 ) -> Result<DistributionResult> {
+    analyze_distributions_selected(input, sample, options, &SiteSelection::default())
+}
+
+/// Builds chromosome BAF distributions after applying regions or targets.
+pub fn analyze_distributions_selected(
+    input: &Path,
+    sample: Option<String>,
+    options: PolysomyOptions,
+    selection: &SiteSelection,
+) -> Result<DistributionResult> {
     validate_options(options)?;
-    let mut reader = SignalReader::open(
+    let selection = CompiledSelection::new(selection)?;
+    let mut reader = SelectedSignalReader::open(
         input,
         SampleSelection {
             query: sample,
             control: None,
         },
         RequiredSignals::Baf,
+        selection,
     )?;
     let sample = reader.query_sample().to_owned();
     let mut histograms = Vec::new();
-    while let Some(site) = reader.next_site()? {
+    reader.visit(false, |site| {
         if histograms
             .last()
             .is_none_or(|histogram: &Histogram| histogram.reference_name != site.reference_name)
@@ -166,7 +189,8 @@ pub fn analyze_distributions(
             .baf
             .ok_or_else(|| invalid("signal reader returned a site without query BAF"))?;
         histograms.last_mut().unwrap().push(baf);
-    }
+        Ok(())
+    })?;
     if histograms.is_empty() {
         return Err(invalid(
             "no informative BAF sites remain after sample selection",

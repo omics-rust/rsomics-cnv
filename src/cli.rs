@@ -1,14 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::process;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use rsomics_common::{OutputArgs, Result, RsomicsError, ToolMeta, run as run_tool};
 use serde::Serialize;
 
-use crate::call::{CallOptions, analyze as analyze_calls, analyze_with_allele_frequencies};
+use crate::call::{
+    CallOptions, analyze_selected as analyze_calls, analyze_with_allele_frequencies_selected,
+};
 use crate::emission::{EvidenceParameters, SampleParameters};
-use crate::polysomy::{PolysomyOptions, analyze as analyze_polysomy};
+use crate::polysomy::{PolysomyOptions, analyze_selected as analyze_polysomy};
 use crate::reports::{write_call_reports, write_polysomy_reports};
+use crate::selection::{OverlapMode, SiteSelection};
 use crate::signals::SampleSelection;
 
 const META: ToolMeta = ToolMeta {
@@ -62,6 +65,9 @@ struct CallArgs {
     #[arg(short = 'f', long = "allele-frequencies", value_name = "TSV")]
     allele_frequencies: Option<PathBuf>,
 
+    #[command(flatten)]
+    selection: SelectionArgs,
+
     /// BAF Gaussian standard deviation
     #[arg(long, default_value_t = 0.04)]
     baf_deviation: f64,
@@ -113,6 +119,9 @@ struct PolysomyArgs {
     #[arg(short, long, value_name = "NAME")]
     sample: Option<String>,
 
+    #[command(flatten)]
+    selection: SelectionArgs,
+
     /// Maximum accepted absolute fit deviation
     #[arg(long, default_value_t = 3.3)]
     fit_threshold: f64,
@@ -142,6 +151,100 @@ struct PolysomyArgs {
     smoothing: i32,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OverlapArg {
+    #[value(name = "0")]
+    Position,
+    #[value(name = "1")]
+    Record,
+    #[value(name = "2")]
+    Variant,
+}
+
+impl From<OverlapArg> for OverlapMode {
+    fn from(value: OverlapArg) -> Self {
+        match value {
+            OverlapArg::Position => Self::Position,
+            OverlapArg::Record => Self::Record,
+            OverlapArg::Variant => Self::Variant,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct SelectionArgs {
+    /// Comma-separated indexed regions
+    #[arg(
+        short = 'r',
+        long,
+        value_delimiter = ',',
+        conflicts_with = "regions_file"
+    )]
+    regions: Vec<String>,
+
+    /// BED, VCF, or tabular indexed regions
+    #[arg(short = 'R', long, value_name = "FILE", conflicts_with = "regions")]
+    regions_file: Option<PathBuf>,
+
+    /// Region inclusion rule: POS, record span, or variant span
+    #[arg(long, default_value = "1")]
+    regions_overlap: OverlapArg,
+
+    /// Comma-separated streaming targets; prefix the first target with ^ to exclude
+    #[arg(
+        short = 't',
+        long,
+        value_delimiter = ',',
+        conflicts_with = "targets_file"
+    )]
+    targets: Vec<String>,
+
+    /// BED, VCF, or tabular streaming targets; prefix the path with ^ to exclude
+    #[arg(short = 'T', long, value_name = "FILE", conflicts_with = "targets")]
+    targets_file: Option<PathBuf>,
+
+    /// Target inclusion rule: POS, record span, or variant span
+    #[arg(long, default_value = "0")]
+    targets_overlap: OverlapArg,
+}
+
+impl SelectionArgs {
+    fn build(mut self) -> Result<SiteSelection> {
+        let mut exclude_targets = false;
+        if let Some(first) = self.targets.first_mut()
+            && let Some(target) = first.strip_prefix('^')
+        {
+            if target.is_empty() {
+                return Err(RsomicsError::ConfigError(
+                    "target list is empty after ^".to_owned(),
+                ));
+            }
+            *first = target.to_owned();
+            exclude_targets = true;
+        }
+        if let Some(path) = &self.targets_file
+            && let Some(value) = path.to_str().and_then(|value| value.strip_prefix('^'))
+        {
+            if value.is_empty() {
+                return Err(RsomicsError::ConfigError(
+                    "target file path is empty after ^".to_owned(),
+                ));
+            }
+            self.targets_file = Some(PathBuf::from(value));
+            exclude_targets = true;
+        }
+        Ok(SiteSelection {
+            regions: self.regions,
+            regions_file: self.regions_file,
+            regions_overlap: self.regions_overlap.into(),
+            targets: self.targets,
+            targets_file: self.targets_file,
+            targets_overlap: self.targets_overlap.into(),
+            exclude_targets,
+        })
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct RunSummary {
     workflow: &'static str,
@@ -163,6 +266,7 @@ fn execute(command: Command) -> Result<RunSummary> {
     match command {
         Command::Call(args) => {
             require_new_output(&args.output)?;
+            let site_selection = args.selection.build()?;
             let selection = SampleSelection {
                 query: args.sample,
                 control: args.control,
@@ -183,9 +287,15 @@ fn execute(command: Command) -> Result<RunSummary> {
                 lrr_smoothing_window: args.lrr_smoothing_window,
             };
             let result = if let Some(frequencies) = args.allele_frequencies {
-                analyze_with_allele_frequencies(&args.input, selection, options, &frequencies)?
+                analyze_with_allele_frequencies_selected(
+                    &args.input,
+                    selection,
+                    options,
+                    &frequencies,
+                    &site_selection,
+                )?
             } else {
-                analyze_calls(&args.input, selection, options)?
+                analyze_calls(&args.input, selection, options, &site_selection)?
             };
             write_call_reports(&args.output, &result)?;
             Ok(RunSummary {
@@ -211,6 +321,7 @@ fn execute(command: Command) -> Result<RunSummary> {
         }
         Command::Polysomy(args) => {
             require_new_output(&args.output)?;
+            let site_selection = args.selection.build()?;
             let result = analyze_polysomy(
                 &args.input,
                 args.sample,
@@ -223,6 +334,7 @@ fn execute(command: Command) -> Result<RunSummary> {
                     include_aa: args.include_aa,
                     smoothing: args.smoothing,
                 },
+                &site_selection,
             )?;
             write_polysomy_reports(&args.output, &result)?;
             Ok(RunSummary {
